@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1652,13 +1652,20 @@
+ extern "C" __attribute__((noinline)) bool
+ native_smufs_cpu_nub_selected(int logical)
+ {
+-    unsigned smp = 0;
++    unsigned smp = 0, core = 0;
+     PE_parse_boot_argn("sheng-smp", &smp, sizeof(smp));
++    bool have_core = PE_parse_boot_argn("sheng-smp-core", &core, sizeof(core)) != 0;
+     int boot = ml_get_boot_cpu_number();
+     __atomic_store_n(&smufs_cpu_smp, smp, __ATOMIC_RELAXED);
+     __atomic_store_n(&smufs_cpu_boot, boot, __ATOMIC_RELAXED);
++    /* P2 boundary: sheng-smp alone no longer selects every slot. A secondary is
++     * published only when sheng-smp-core explicitly selects CPU1. Both the default
++     * configuration and "sheng-smp without a target" stay single-core. Unselected
++     * nubs keep their parent attachment and are only withheld from registration.
++     */
+     bool selected = logical >= 0 &&
+-        (logical == boot || (smp != 0 && logical < 8));
++        (logical == boot ||
++         (smp != 0 && have_core && core == 1 && logical == static_cast<int>(core)));
+     if (selected) __atomic_add_fetch(&smufs_cpu_eligible, 1U, __ATOMIC_RELAXED);
+     else {
+         __atomic_add_fetch(&smufs_cpu_withheld, 1U, __ATOMIC_RELAXED);

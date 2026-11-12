@@ -1,0 +1,118 @@
+schema_version = 2
+
+[board]
+name = "instantnoodlep"
+soc = "SM8250"
+soc_source = "sm8250"
+os_profile = "ipados-17.7.11-21H461"
+description = "OnePlus 8 Pro (IN2020)"
+kit = "instantnoodlep"
+
+[components]
+# Complete list: arrays replace the inherited array, they do not merge.
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "AppleKeyStoreState", "XnuPrelink", "DarwinBoot", "RamBlock", "GopFramebuffer"]
+
+[kernel]
+defconfig = "instantnoodlep_defconfig"
+archives = [
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "component:ArmDTPlatform",
+  "component:ArmCpu",
+  "component:SoftwareAES",
+  "build-software-aes-bindings.py",
+  "build-mockfs-fixture.py",
+  "build-platform-power.py",
+  "build-sm8250-watchdog.py",
+  "build-sm8250-boot-status.py",
+  "build-sm8250-thermal-hid.py",
+  "build-sm8250-usb-debug.py",
+  "build-sm8250-display.py",
+  "component:AppleKeyStoreState",
+  "build-sm8250-key-events.py",
+  "build-sm8250-touch-hid.py",
+  "build-sm8250-a650.py",
+  "build-sm8250-ufs.py",
+  "component:RamBlock",
+  "build-sm8250-ram-block.py",
+  "build-libpthread-kernel.py",
+]
+config_fragments = ["arch:configs/common.config", "soc:configs/sm8250.config", "os:configs/ipados.config"]
+# device:patches/xnu/series replaces the OS series (see that file) to leave out the
+# optional boot-progress patch, which cannot apply without the SM8550 PMGR block.
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "device:patches/xnu/series"]
+
+[device_tree]
+source = "device:dts/instantnoodlep.dts"
+include_dirs = ["soc:dts"]
+
+[firmware]
+config = "instantnoodlep"
+dsc = "Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.dsc"
+fd = "Build/instantnoodlepPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/OnePlus",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+  "{uefi}/Silicon/Qualcomm",
+  "{uefi}/Silicon/Silicium",
+  "{uefi}/Silicium-ACPI",
+  "{uefi}/Silicium-ACPI/Platforms/OnePlus",
+  "{uefi}/Silicium-ACPI/Silicon/Qualcomm",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+]
+
+[firmware.defines]
+# The platform sources test these names with #if, so an undefined value is a
+# preprocessor error rather than a default.
+DEVICE_MODEL = "instantnoodlep"
+ENABLE_SECUREBOOT = "0"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
+BUILDID_STRING = "instantnoodlep-bringup"
+
+[payload]
+volume = "UNIXNU"
+# The boot partition is 96 MiB and the payload volume is flashed into boot_a, so this
+# has to stay below it. Raise only after measuring the packaged kernel.
+size_mib = 88
+loader = "firmware"
+title = "UniXNU"
+# Must equal the memory node size in dts/instantnoodlep.dts; the ADT step checks it.
+dram_size = "0x200000000"
+panic_screen = true
+tools = true
+kernel_args = ["-v", "serial=3", "debug=0x14e", "sheng-pmgr=2", "native-ufs-probe=36", "offline-key-events=1"]
+
+[payload.adt]
+packed_data_ramdisk = true
+# Actual OS APSB UUID, independently extracted and checked: handoff section 17.
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+chip_id = "207"
+owned_memory_size = "0x100000000"
+unique_chip_id = "required"
+
+# Hardware-validated primary GPT: userdata slot 23, inclusive bounds (v15+).
+# This builds a SHNGROOT container; native root-window publication is a separate gate.
+[userdata]
+first_lba = 0x003f13a8
+last_lba = 0x03ae47fa
+lba_bytes = 4096
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+# The board has power and volume keys. The ADT advertises no mechanical Home key.
+[adt.buttons.string]
+compatible = "buttons"
+device_type = "buttons"
+
+[adt.buttons.strings]
+button-names = ["hold", "voldown", "volup"]
+
+[adt.buttons.u32]
+home-button-type = 2

@@ -1,0 +1,235 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -565,6 +565,7 @@
+ #endif
+ 
+ #include <sys/smufs_root_trace.h>
++#include <sys/smufs_init_trace.h>
+ 
+ /* Terminal board probe: no allocator, constructor, printing or blocking lock. */
+ static SmUfsRootTraceState smufs_root_trace_state;
+@@ -593,8 +594,9 @@
+     return smufs_rt_core_snapshot(&smufs_root_trace_state, out);
+ }
+ 
+-/* H3C observer: refusal and the post-devfs boundary. Evidence stays in panic. */
++/* H3D observer: original owner evidence and actual init exec results. */
+ static int smufs_saved_autherr=-1, smufs_saved_owner=0, smufs_saved_require=0, smufs_saved_seen=0;
++static int smufs_saved_devfs=-1;
+ __attribute__((noinline, noreturn)) static void
+ native_smufs_auth_diag(const char *boundary, int autherr, int owner_authorized, int require_rootauth, int devfs_error)
+ {
+@@ -626,10 +628,14 @@
+ #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST
+ 	trust_enabled = 1;
+ #endif
+-	panic("SMUFS root-h3c phase=%s autherr=%d owner_auth=%d require=%d seen%d devfs-errno%d\n"
++	panic("SMUFS root-h3d phase=%s autherr=%d owner_auth=%d require=%d seen%d devfs-errno%d\n"
+ 	      "root %s selected%x mounted%x mount-valid%d vnode%d ro%d flags%llx fs=%s\n"
+ 	      "smufs en%u policy%u sig%u imm%u bound%u uniq%u uuid%u typed%u chain%u ro%u\n"
+ 	      "units%llu checked%llu bad%llu media%llx self%u/15 trust%u\n"
++	      "init en%u attempts%u stage%u path=%.96s\n"
++	      "exec %u/%u errno%d alloc%d scratch%u\n"
++	      "lookup%u/%u errno%d perm%u errno%d read%u/%u errno%d magic%x\n"
++	      "activate%u/%u errno%d signature%u/%u errno%d\n"
+ 	      "owner audit%d trust%d decision%d ro%d selected%x mounted%x\n"
+ 	      "trace en%u coherent%u partial%u lost%u writes%u\n"
+ 	      "mount%u/%u errno%d secure%u/%u\n"
+@@ -643,6 +649,13 @@
+ 	      (unsigned long long)smufs_owner.units, (unsigned long long)smufs_owner.verified,
+ 	      (unsigned long long)smufs_owner.failures, (unsigned long long)smufs_owner.media_id,
+ 	      smufs_owner.selftests, smufs_owner.trust_requested,
++	      native_smufs_init_trace.enabled, native_smufs_init_trace.attempts, native_smufs_init_trace.stage, native_smufs_init_trace.path,
++	      native_smufs_init_trace.exec_enter, native_smufs_init_trace.exec_return, native_smufs_init_trace.exec_error, native_smufs_init_trace.alloc_error, native_smufs_init_trace.scratch,
++	      native_smufs_init_trace.lookup_enter, native_smufs_init_trace.lookup_return, native_smufs_init_trace.lookup_error,
++	      native_smufs_init_trace.permission_return, native_smufs_init_trace.permission_error,
++	      native_smufs_init_trace.read_enter, native_smufs_init_trace.read_return, native_smufs_init_trace.read_error, native_smufs_init_trace.magic,
++	      native_smufs_init_trace.activate_enter, native_smufs_init_trace.activate_return, native_smufs_init_trace.activate_error,
++	      native_smufs_init_trace.signature_enter, native_smufs_init_trace.signature_return, native_smufs_init_trace.signature_error,
+ 	      audit_enabled, trust_enabled, owner_decision, owner_readonly, (uint32_t)owner_selected, (uint32_t)owner_mount,
+ 	      snapshot.enabled, coherent, snapshot.partial, snapshot.lost, snapshot.writes,
+ 	      r[SMRT_MOUNT_ENTER].count, r[SMRT_MOUNT_RETURN].count, r[SMRT_MOUNT_RETURN].result,
+@@ -653,6 +666,14 @@
+ 	      r[SMRT_DEVFS_ENTER].count, r[SMRT_DEVFS_RETURN].count, r[SMRT_DEVFS_RETURN].result);
+ }
+ 
++
++
++__attribute__((noinline,noreturn)) void
++native_smufs_init_diag(const char *phase,int error)
++{
++ native_smufs_init_trace.exec_error=error;
++ native_smufs_auth_diag(phase,smufs_saved_autherr,smufs_saved_owner,smufs_saved_require,smufs_saved_devfs);
++}
+ 
+ void
+ bsd_init(void)
+@@ -1298,6 +1319,7 @@
+ 		bsd_init_kprintf("calling devfs_kernel_mount\n");
+ 		native_smufs_root_trace_emit(SMRT_DEVFS_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 		int smufs_devfs_error = devfs_kernel_mount(mounthere);
++		smufs_saved_devfs=smufs_devfs_error;
+ 		native_smufs_root_trace_emit(SMRT_DEVFS_RETURN, 0, SMRT_ERRNO, smufs_devfs_error, 0, 0);
+ 		uint32_t smufs_stop_after_devfs = 0;
+ 		if (PE_parse_boot_argn("native-ufs-owner-stop-after-devfs", &smufs_stop_after_devfs, sizeof(smufs_stop_after_devfs)) && smufs_stop_after_devfs == 1)
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -187,6 +187,12 @@
+ 
+ #include <mach/exclaves.h>
+ 
++#include <sys/smufs_init_trace.h>
++struct SmUfsInitTrace native_smufs_init_trace;
++static inline int smufs_init_tracing(void) {
++ return native_smufs_init_trace.enabled && proc_getpid(current_proc())==1;
++}
++
+ extern boolean_t vm_darkwake_mode;
+ 
+ /* enable crash reports on various exec failures */
+@@ -2244,7 +2250,9 @@
+ 	    UIO_SYSSPACE, CAST_USER_ADDR_T(excpath), imgp->ip_vfs_context);
+ 
+ again:
++	if (smufs_init_tracing()) { native_smufs_init_trace.lookup_enter++; native_smufs_init_trace.stage=3; }
+ 	error = namei(ndp);
++	if (smufs_init_tracing()) { native_smufs_init_trace.lookup_return++; native_smufs_init_trace.lookup_error=error; native_smufs_init_trace.stage=4; }
+ 	if (error) {
+ 		if (error == ERESTART) {
+ 			error = EINTR;
+@@ -2274,6 +2282,7 @@
+ 	}
+ 
+ 	error = exec_check_permissions(imgp);
++	if (smufs_init_tracing()) { native_smufs_init_trace.permission_return++; native_smufs_init_trace.permission_error=error; native_smufs_init_trace.stage=5; }
+ 	if (error) {
+ 		goto bad;
+ 	}
+@@ -2284,10 +2293,13 @@
+ 		*imgp->ip_origvattr = *imgp->ip_vattr;
+ 	}
+ 
++
++	if (smufs_init_tracing()) { native_smufs_init_trace.read_enter++; native_smufs_init_trace.stage=6; }
+ 	error = vn_rdwr(UIO_READ, imgp->ip_vp, imgp->ip_vdata, PAGE_SIZE, 0,
+ 	    UIO_SYSSPACE, IO_NODELOCKED,
+ 	    vfs_context_ucred(imgp->ip_vfs_context),
+ 	    &resid, vfs_context_proc(imgp->ip_vfs_context));
++	if (smufs_init_tracing()) { native_smufs_init_trace.read_return++; native_smufs_init_trace.read_error=error; native_smufs_init_trace.stage=7; if (!error && resid <= PAGE_SIZE-4) memcpy(&native_smufs_init_trace.magic,imgp->ip_vdata,4); }
+ 	if (error) {
+ 		goto bad;
+ 	}
+@@ -2304,7 +2316,10 @@
+ 	}
+ 	error = -1;
+ 	for (i = 0; error == -1 && execsw[i].ex_imgact != NULL; i++) {
++
++	if (smufs_init_tracing()) { native_smufs_init_trace.activate_enter++; native_smufs_init_trace.stage=8; }
+ 		error = (*execsw[i].ex_imgact)(imgp);
++	if (smufs_init_tracing()) { native_smufs_init_trace.activate_return++; native_smufs_init_trace.activate_error=error; native_smufs_init_trace.stage=9; }
+ 
+ 		switch (error) {
+ 		/* case -1: not claimed: continue */
+@@ -5292,7 +5307,10 @@
+ 		 * until the csblob in the textvp is accurately reflected.
+ 		 */
+ 		ipc_task_enable(new_task);
++
++	if (smufs_init_tracing()) { native_smufs_init_trace.signature_enter++; native_smufs_init_trace.stage=10; }
+ 		error = process_signature(p, imgp);
++	if (smufs_init_tracing()) { native_smufs_init_trace.signature_return++; native_smufs_init_trace.signature_error=error; native_smufs_init_trace.stage=11; }
+ 	}
+ 
+ #if defined(HAS_APPLE_PAC)
+@@ -8044,7 +8062,7 @@
+ #endif
+ 
+ static int
+-load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path, user_addr_t envp)
++smufs_init_program_at_path_impl(proc_t p, user_addr_t scratch_addr, const char* path, user_addr_t envp)
+ {
+ 	int retval[2];
+ 	int error;
+@@ -8126,7 +8144,30 @@
+ 	 */
+ 	set_security_token(p, proc_ucred_unsafe(p));
+ 
++
++	if (smufs_init_tracing()) { native_smufs_init_trace.exec_enter=1; native_smufs_init_trace.stage=2; }
+ 	return execve(p, &init_exec_args, retval);
++}
++
++static int
++load_init_program_at_path(proc_t p,user_addr_t scratch_addr,const char *path,user_addr_t envp)
++{
++ if (smufs_init_tracing()) {
++  uint32_t attempts=native_smufs_init_trace.attempts+1;
++  int32_t allocated=native_smufs_init_trace.alloc_error;
++  memset(&native_smufs_init_trace,0,sizeof(native_smufs_init_trace));
++  native_smufs_init_trace.enabled=1; native_smufs_init_trace.attempts=attempts;
++  native_smufs_init_trace.alloc_error=allocated; native_smufs_init_trace.scratch=scratch_addr!=0;
++  native_smufs_init_trace.stage=1; strlcpy(native_smufs_init_trace.path,path,sizeof(native_smufs_init_trace.path));
++ }
++ int error=smufs_init_program_at_path_impl(p,scratch_addr,path,envp);
++ if (smufs_init_tracing()) {
++  native_smufs_init_trace.exec_return=native_smufs_init_trace.exec_enter;
++  native_smufs_init_trace.exec_error=error;
++  if (native_smufs_init_trace.exec_enter) native_smufs_init_trace.stage=12;
++  if (error!=ENOENT) native_smufs_init_diag(native_smufs_init_trace.exec_enter?"init-exec-return":"init-prep-failed",error);
++ }
++ return error;
+ }
+ 
+ static const char * init_programs[] = {
+@@ -8177,7 +8218,14 @@
+ 	mach_vm_offset_t scratch_addr = 0;
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
+ 
+-	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
++	uint32_t smufs_init_selector=0;
++	if (PE_parse_boot_argn("native-ufs-init-diag",&smufs_init_selector,sizeof(smufs_init_selector)) && smufs_init_selector==1 && proc_getpid(p)==1)
++		native_smufs_init_trace.enabled=1;
++	kern_return_t smufs_allocation=mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
++	if (smufs_init_tracing()) {
++		native_smufs_init_trace.alloc_error=smufs_allocation; native_smufs_init_trace.scratch=scratch_addr!=0;
++		if (smufs_allocation || !scratch_addr) native_smufs_init_diag("init-allocate",smufs_allocation?smufs_allocation:ENOMEM);
++	}
+ 	user_addr_t init_envp = USER_ADDR_NULL;
+ #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
+ 	int cache_error = native_owner_cache_prepare(p, (user_addr_t)scratch_addr, &init_envp);
+@@ -8217,6 +8265,7 @@
+ 				return;
+ 			}
+ 
++			if (smufs_init_tracing()) native_smufs_init_diag("init-exhausted",error);
+ 			panic("Process 1 exec of launchd.release failed, errno %d", error);
+ 		} else {
+ 			strlcpy(launchd_path, "/usr/appleinternal/sbin/launchd.", sizeof(launchd_path));
+@@ -8244,6 +8293,7 @@
+ 		}
+ 	}
+ 
++	if (smufs_init_tracing()) native_smufs_init_diag("init-exhausted",error);
+ 	panic("Process 1 exec of %s failed, errno %d", ((i == 0) ? "<null>" : init_programs[i - 1]), error);
+ }
+ 
+--- /dev/null
++++ b/bsd/sys/smufs_init_trace.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++#ifndef SMUFS_INIT_TRACE_H
++#define SMUFS_INIT_TRACE_H
++#include <stdint.h>
++struct SmUfsInitTrace {
++ uint32_t enabled,attempts,stage,scratch,exec_enter,exec_return;
++ int32_t alloc_error,exec_error;
++ uint32_t lookup_enter,lookup_return; int32_t lookup_error;
++ uint32_t permission_return; int32_t permission_error;
++ uint32_t read_enter,read_return; int32_t read_error; uint32_t magic;
++ uint32_t activate_enter,activate_return; int32_t activate_error;
++ uint32_t signature_enter,signature_return; int32_t signature_error;
++ char path[128];
++};
++extern struct SmUfsInitTrace native_smufs_init_trace;
++__attribute__((noreturn)) void native_smufs_init_diag(const char *phase,int error);
++#endif

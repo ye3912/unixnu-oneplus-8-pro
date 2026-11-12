@@ -1,0 +1,5 @@
+# Included source snapshot; no machine-specific parent checkout required.
+[[source]]
+name = "sm8250"
+kind = "soc"
+local = "support/UniXNU-sm8250-common"

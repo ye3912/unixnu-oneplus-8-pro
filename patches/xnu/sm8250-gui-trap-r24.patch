@@ -1,0 +1,64 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1823,6 +1823,7 @@
+  * Never changes signal/exit policy or invokes user code. */
+ #if DEVELOPMENT || DEBUG
+ extern int native_sm_gui_cache_identity(task_t, unsigned char *, uint32_t *);
++extern int native_sm_gui_fault_state(uint64_t *, unsigned);
+ static void
+ sm_gui_exit_evidence(proc_t p, int rv)
+ {
+@@ -1847,8 +1848,27 @@
+   (unsigned long long)(reason?reason->osr_code:0),description?description:"none");
+  task_t task=proc_task(p);
+  unsigned char cache_uuid[16];uint32_t slide=0;
+- if(WTERMSIG(rv)!=SIGABRT || !task || !native_sm_gui_cache_identity(task,cache_uuid,&slide) || memcmp(cache_uuid,expected_cache,16))return;
++ if((WTERMSIG(rv)!=SIGABRT && WTERMSIG(rv)!=SIGTRAP) || !task || !native_sm_gui_cache_identity(task,cache_uuid,&slide) || memcmp(cache_uuid,expected_cache,16))return;
+  printf("GUIEXIT22 cache-match1 slide%x\n",slide);
++ uint64_t state[15]={0};unsigned char exec_uuid[16]={0};char uuid_text[33]={0};
++ proc_getexecutableuuid(p,exec_uuid,sizeof(exec_uuid));
++ static const char hex[]="0123456789abcdef";
++ for(unsigned j=0;j<16;++j){uuid_text[2*j]=hex[exec_uuid[j]>>4];uuid_text[2*j+1]=hex[exec_uuid[j]&15];}
++ if(native_sm_gui_fault_state(state,15)) {
++  printf("GUITRAP24 name=%s pid%d pc%llx lr%llx fp%llx sp%llx far%llx esr%llx exec%llx uuid%s slide%x\n",
++   targets[index],proc_getpid(p),(unsigned long long)state[0],(unsigned long long)state[1],(unsigned long long)state[2],
++   (unsigned long long)state[3],(unsigned long long)state[4],(unsigned long long)state[5],(unsigned long long)state[14],uuid_text,slide);
++  for(unsigned j=0;j<8;j+=2)printf("GUITRAP24 regs x%u=%llx x%u=%llx\n",j,(unsigned long long)state[6+j],j+1,(unsigned long long)state[7+j]);
++  uint64_t fp=state[2],low=state[3],high=low+65536;
++  if(high>=low)for(unsigned j=0;j<8;++j) {
++   uint64_t pair[2]={0};
++   if(fp<low || fp>high-16 || (fp&15) || copyin(fp,pair,sizeof(pair)))break;
++   printf("GUITRAP24 frame%u lr%llx\n",j,(unsigned long long)pair[1]);
++   if(pair[0]<=fp || pair[0]>high-16 || (pair[0]&15))break;
++   fp=pair[0];
++  }
++ } else printf("GUITRAP24 name=%s pid%d saved-state-unavailable\n",targets[index],proc_getpid(p));
++
+  for(unsigned i=0;i<sizeof(images)/sizeof(images[0]);++i) {
+   unsigned char uuid[16];uint64_t first[8]={0},after[8]={0};
+   int error=copyin(images[i].uuid_va+slide,uuid,sizeof(uuid));
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10299,3 +10299,22 @@
+  return 1;
+ }
+ #endif
++
++/* R24: owning current-thread saved state, read only; no target stop/write. */
++#if (DEVELOPMENT || DEBUG) && defined(__arm64__)
++#include <arm/thread.h>
++#include <mach/arm/thread_status.h>
++#include <machine/machine_routines.h>
++int native_sm_gui_fault_state(uint64_t *, unsigned);
++int native_sm_gui_fault_state(uint64_t *out, unsigned count)
++{
++ if(!out || count!=15)return 0;
++ const arm_saved_state_t *source=get_user_regs(current_thread());arm_saved_state_t saved;
++ if(!source || ml_nofault_copy((vm_offset_t)source,(vm_offset_t)&saved,sizeof(saved))!=sizeof(saved) ||
++  !is_saved_state64(&saved) || saved.ash.count!=ARM_SAVED_STATE64_COUNT)return 0;
++ out[0]=get_saved_state_pc(&saved);out[1]=get_saved_state_lr(&saved);out[2]=get_saved_state_fp(&saved);
++ out[3]=get_saved_state_sp(&saved);out[4]=get_saved_state_far(&saved);out[5]=get_saved_state_esr(&saved);
++ for(unsigned j=0;j<8;++j)out[6+j]=get_saved_state_reg(&saved,j);
++ out[14]=current_task()->mach_header_vm_address;return 1;
++}
++#endif

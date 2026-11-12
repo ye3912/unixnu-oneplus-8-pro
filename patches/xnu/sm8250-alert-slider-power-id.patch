@@ -1,0 +1,329 @@
+--- a/bsd/dev/Sm8250AlertSlider.c
++++ b/bsd/dev/Sm8250AlertSlider.c
+@@ -1,13 +1,17 @@
+ /* SPDX-License-Identifier: BSD-2-Clause-Patent */
+ /* IN2020 factory DTS i2c@984000; gcc-kona.c wrap0 S1; pinctrl-kona.c GPIO4/5.
+- * Discovery only: no sensor register, PMIC voltage or rail-enable writes.
++ * Discovery only: no sensor configuration writes. L10 is qualified and
++ * brought up at 3008 mV through the existing bounded RPMh sender.
+  * Called before the physical-key worker acquires the shared SPMI observer.
+  */
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ #include <vm/memory_types.h>
+ #include "GeniI2c.h"
++#define KEBAB_RPMH_KERNEL 1
++#include "KebabRpmhVrm.h"
+ #include "kebab_spmi_bus.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+@@ -23,6 +27,8 @@
+     Status = 0x40, Active = (1u << 0) | (1u << 12),
+     TxStatus = 0x800, GsiEnable = 0xe18,
+     L10Sid = 5, L10Base = 0x4900, L10Ppid = 0x549,
++    CommandDbPa = 0x80860000, CommandDbSize = 0x20000,
++    RscPa = 0x18220000, RscTcsBase = 0xd00, RscTcsStride = 0x2a0,
+ };
+ #define CLOCK_OFF (1u << 31)
+ 
+@@ -44,6 +50,52 @@
+ {
+     /* This one-shot consumer polls; never enable a new interrupt route. */
+     if (reg != GENI_SE_IRQ_EN) slider_write(ctx, reg, value);
++}
++
++static int
++slider_tcs_read(void *ctx, uint32_t off, uint32_t *value)
++{
++    if (off >= RscTcsStride || (off & 3)) return -1;
++    *value = slider_read(ctx, off);
++    return 0;
++}
++
++static int
++slider_tcs_write(void *ctx, uint32_t off, uint32_t value)
++{
++    if (off >= RscTcsStride || (off & 3)) return -1;
++    slider_write(ctx, off, value);
++    return 0;
++}
++
++static uint64_t
++slider_now_us(void *ctx)
++{
++    (void)ctx;
++    uint64_t ns;
++    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++    return ns / 1000;
++}
++
++static bool
++slider_pmic(uint32_t apid, uint32_t off, uint8_t *value)
++{
++    uint8_t second = 0;
++    return kebab_spmi_obs_read_ex(apid, L10Sid, L10Base + off, 1, false, true, value) == 0 &&
++        kebab_spmi_obs_read_ex(apid, L10Sid, L10Base + off, 2, false, true, &second) == 0 && *value == second;
++}
++
++static bool
++slider_send(kebab_rpmh_tcs *channel, bool enable)
++{
++    kebab_rpmh_cmd cmd;
++    kebab_rpmh_status rc = enable ? kebab_rpmh_encode_enable("ldoc10", &cmd) :
++        kebab_rpmh_encode_voltage("ldoc10", 3008, &cmd);
++    if (rc != KEBAB_RPMH_OK) return false;
++    rc = kebab_rpmh_tcs_send(channel, &cmd);
++    printf("SLIDER rpmh reg=%s addr=%x data=%u result=%d phase=%u status=%x\n",
++        enable ? "enable" : "voltage", cmd.addr, cmd.data, rc, channel->phase, channel->last_status);
++    return rc == KEBAB_RPMH_OK;
+ }
+ 
+ static bool
+@@ -56,6 +108,8 @@
+     spmi.core = ml_io_map_unmappable(KEBAB_SPMI_CORE_PA, SpmiCoreSpan, VM_WIMG_IO);
+     spmi.cnfg = ml_io_map_unmappable(KEBAB_SPMI_CNFG_PA, KEBAB_SPMI_CNFG_SIZE, VM_WIMG_IO);
+     spmi.obsrvr = ml_io_map_unmappable(KEBAB_SPMI_OBSRV_PA, KEBAB_SPMI_OBSRV_SIZE, VM_WIMG_IO);
++    vm_offset_t db = ml_io_map_unmappable(CommandDbPa, CommandDbSize, VM_WIMG_IO);
++    vm_offset_t rsc = ml_io_map_unmappable(RscPa, Window, VM_WIMG_IO);
+     struct kebab_spmi_match match = {0};
+     uint32_t matches = 0;
+     uint8_t type = 0, subtype = 0, lo = 0, hi = 0, en = 0;
+@@ -64,21 +118,46 @@
+         kebab_spmi_version_known(kebab_spmi_rd(spmi.core, KEBAB_SPMI_VERSION))) {
+         matches = kebab_spmi_scan(L10Ppid, &match, 1);
+         if (matches == 1 && match.write_ee == 4) {
+-            read = kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 4, 1, false, true, &type) == 0 &&
+-                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 5, 1, false, true, &subtype) == 0 &&
+-                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 0x40, 1, false, true, &lo) == 0 &&
+-                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 0x41, 1, false, true, &hi) == 0 &&
+-                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 0x46, 1, false, true, &en) == 0;
++            read = slider_pmic(match.apid, 4, &type) && slider_pmic(match.apid, 5, &subtype) &&
++                slider_pmic(match.apid, 0x40, &lo) && slider_pmic(match.apid, 0x41, &hi) &&
++                slider_pmic(match.apid, 0x46, &en);
+         }
+     }
+-    /* Known PMIC5 510 LDO layouts, as used by the existing qualified touch path.
+-     * Factory ldoc10 bounds are 3,000,000..3,312,000 uV; retain firmware voltage.
++    /* Actual IN2020 result is PMIC5 MV_P600_510 subtype 0x7d. Both stock
++     * sensor variants and the factory ldoc10 constraints accept 3008 mV.
+      */
+-    const unsigned mv = ((unsigned)hi << 8) | lo;
+-    const bool ready = read && type == 4 && (subtype == 0x71 || subtype == 0x7b) &&
+-        mv >= 3000 && mv <= 3312 && en == 0x80;
+-    printf("SLIDER rail ldoc10 ppid=%x matches=%u owner=%u read=%u type=%x/%x mv=%u en=%x ready=%u writes=0\n",
+-        (unsigned)L10Ppid, matches, match.write_ee, read, type, subtype, mv, en, ready);
++    unsigned mv = ((unsigned)hi << 8) | lo;
++    bool ready = false;
++    printf("SLIDER rail-before ldoc10 ppid=%x matches=%u owner=%u read=%u type=%x/%x mv=%u en=%x\n",
++        (unsigned)L10Ppid, matches, match.write_ee, read, type, subtype, mv, en);
++    if (!read || type != 4 || subtype != 0x7d || mv < 3000 || mv > 3312 || (en != 0 && en != 0x80) || !db || !rsc) goto out;
++    uint32_t address = 0;
++    const kebab_rpmh_status lookup = kebab_rpmh_cmd_db_lookup((const uint8_t *)db, CommandDbSize, "ldoc10", &address);
++    printf("SLIDER db ldoc10 lookup=%d addr=%x\n", lookup, address);
++    const uint32_t parent = slider_read((void *)rsc, 0x0c);
++    const uint32_t ie = slider_read((void *)rsc, RscTcsBase), is = slider_read((void *)rsc, RscTcsBase + 4);
++    if (lookup != KEBAB_RPMH_OK || ((parent >> 12) & 0x3f) != 8 ||
++        ((parent >> 27) & 0x1f) != 16 || ((ie | is) & 2)) goto out;
++    kebab_rpmh_tcs channel;
++    const kebab_tcs_io io = {slider_tcs_read, slider_tcs_write, slider_now_us,
++        (void *)(rsc + RscTcsBase + RscTcsStride)};
++    kebab_rpmh_tcs_init_global(&channel, io);
++    /* Do not change a rail another client has already enabled. */
++    if (mv != 3008) {
++        if (en || !slider_send(&channel, false) ||
++            !slider_pmic(match.apid, 0x40, &lo) || !slider_pmic(match.apid, 0x41, &hi)) goto out;
++        mv = ((unsigned)hi << 8) | lo;
++        if (mv != 3008) goto out;
++    }
++    if (!en && !slider_send(&channel, true)) goto out;
++    delay(20000);
++    ready = slider_pmic(match.apid, 0x46, &en) && en == 0x80 &&
++        slider_pmic(match.apid, 0x40, &lo) && slider_pmic(match.apid, 0x41, &hi) &&
++        (((unsigned)hi << 8) | lo) == 3008;
++out:
++    printf("SLIDER rail-after mv=%u en=%x ready=%u\n", mv, en, ready);
++    if (rsc) ml_io_unmap(rsc, Window);
++    if (db) ml_io_unmap(db, CommandDbSize);
+     if (spmi.obsrvr) ml_io_unmap(spmi.obsrvr, KEBAB_SPMI_OBSRV_SIZE);
+     if (spmi.cnfg) ml_io_unmap(spmi.cnfg, KEBAB_SPMI_CNFG_SIZE);
+     if (spmi.core) ml_io_unmap(spmi.core, SpmiCoreSpan);
+@@ -166,12 +245,15 @@
+ {
+     unsigned enabled = 0;
+     if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || enabled != 1) return;
+-    printf("SLIDER probe begin mode=id\n");
++    printf("SLIDER probe begin mode=power-id\n");
+     vm_offset_t branches = ml_io_map_unmappable(GccBranch, Window, VM_WIMG_IO);
+     vm_offset_t votes = ml_io_map_unmappable(GccVotes, Window, VM_WIMG_IO);
+     vm_offset_t pins = ml_io_map_unmappable(Pins4, Window, VM_WIMG_IO);
+     vm_offset_t engine = 0;
+-    bool vote_added = false, idle = true;
++    uint32_t added_votes = 0;
++    bool pins_changed = false, idle = true, configured = false;
++    static const uint32_t setup_regs[] = {0x28, 0x24, 0x20, 0x7c, GENI_CLK_CFG, GENI_SCL_COUNTERS};
++    uint32_t setup_saved[sizeof(setup_regs) / sizeof(setup_regs[0])];
+     if (!branches || !votes || !pins) {printf("SLIDER probe skipped=map\n"); goto done;}
+     const uint32_t vote = slider_read((void *)votes, VoteReg);
+     const uint32_t ma = slider_read((void *)branches, MasterAhb);
+@@ -179,30 +261,32 @@
+     uint32_t cb = slider_read((void *)branches, SeBranch);
+     const uint32_t cfg = slider_read((void *)branches, SeRoot + 4);
+     const uint32_t dfs = slider_read((void *)branches, SeRoot + 0x14);
+-    printf("SLIDER clocks vote=%x m=%x s=%x se=%x cfg=%x dfs=%x\n", vote, ma, sa, cb, cfg, dfs);
++    const uint32_t perf0 = slider_read((void *)branches, SeRoot + 0x1c);
++    printf("SLIDER clocks vote=%x m=%x s=%x se=%x cfg=%x dfs=%x perf0=%x\n", vote, ma, sa, cb, cfg, dfs, perf0);
+     const uint32_t p4 = slider_read((void *)pins, 0), p5 = slider_read((void *)pins, 0x1000);
+     const uint32_t sda = slider_read((void *)pins, 4), scl = slider_read((void *)pins, 0x1004);
+     printf("SLIDER pins gpio4=%x gpio5=%x sda=%x scl=%x\n", p4, p5, sda, scl);
+-    const bool rail = slider_power_ready();
+-    /* Retain the firmware's selected mux and timing; qualification never changes
+-     * clock roots or drives released GPIO pins as outputs.
+-     */
+-    if ((vote & VoteAhb) != VoteAhb || (ma & CLOCK_OFF) ||
+-        ((sa & CLOCK_OFF) && !(sa & 2))) {printf("SLIDER probe skipped=ahb\n"); goto done;}
+-    if (!rail) {printf("SLIDER probe skipped=rail\n"); goto done;}
+-    if ((p4 & 0x23c) != 4 || (p5 & 0x23c) != 4 || !(sda & scl & 1)) {
++    if (cfg != 0x100000 || dfs != 0x21 || perf0 != 1) {
++        printf("SLIDER probe skipped=clock-source\n"); goto done;
++    }
++    if ((p4 != 0 && p4 != 1 && p4 != 4) || (p5 != 0 && p5 != 1 && p5 != 4) || !(sda & scl & 1)) {
+         printf("SLIDER probe skipped=pin-state\n"); goto done;
+     }
+-    if (!(vote & VoteS1)) {
+-        slider_write((void *)votes, VoteReg, vote | VoteS1);
+-        vote_added = true;
++    added_votes = (VoteS1 | VoteAhb) & ~vote;
++    if (added_votes) {
++        slider_write((void *)votes, VoteReg, vote | added_votes);
+     }
+     for (unsigned tries = 0; tries < 200; ++tries) {
+         cb = slider_read((void *)branches, SeBranch);
+-        if (!(cb & CLOCK_OFF)) break;
++        const uint32_t m = slider_read((void *)branches, MasterAhb), s = slider_read((void *)branches, SlaveAhb);
++        if (!(cb & CLOCK_OFF) && !(m & CLOCK_OFF) && (!(s & CLOCK_OFF) || (s & 2))) break;
+         delay(10);
+     }
+-    if (cb & CLOCK_OFF) {printf("SLIDER probe skipped=se-clock\n"); goto done;}
++    const uint32_t m = slider_read((void *)branches, MasterAhb), s = slider_read((void *)branches, SlaveAhb);
++    const uint32_t voted = slider_read((void *)votes, VoteReg);
++    printf("SLIDER clocks-after vote=%x m=%x s=%x se=%x\n", voted, m, s, cb);
++    if ((cb & CLOCK_OFF) || (m & CLOCK_OFF) || ((s & CLOCK_OFF) && !(s & 2)) ||
++        (voted & (VoteS1 | VoteAhb)) != (VoteS1 | VoteAhb)) {printf("SLIDER probe skipped=clock-vote\n"); goto done;}
+     engine = ml_io_map_unmappable(Se1, Window, VM_WIMG_IO);
+     if (!engine) {printf("SLIDER probe skipped=engine-map\n"); goto done;}
+     void *se = (void *)engine;
+@@ -216,13 +300,41 @@
+         (route & GENI_SE_M_IRQ_EN) || slider_read(se, GsiEnable) ||
+         (slider_read(se, GENI_IF_DISABLE) & 1) || (slider_read(se, GENI_DMA_MODE) & 1) ||
+         (slider_read(se, TxStatus) & 0xfffffff) || (slider_read(se, GENI_RX_FIFO_STATUS) & 0x1ffffff) ||
+-        slider_read(se, GENI_TX_WATERMARK) || !(clock & 1) || !timing) {
++        slider_read(se, GENI_TX_WATERMARK)) {
+         printf("SLIDER probe skipped=engine-state\n"); goto done;
++    }
++    if (!slider_power_ready()) {printf("SLIDER probe skipped=rail\n"); goto done;}
++    slider_write((void *)pins, 0, 4);
++    pins_changed = true;
++    slider_write((void *)pins, 0x1000, 4);
++    if (slider_read((void *)pins, 0) != 4 || slider_read((void *)pins, 0x1000) != 4 ||
++        !(slider_read((void *)pins, 4) & slider_read((void *)pins, 0x1004) & 1)) {
++        printf("SLIDER probe skipped=pin-readback\n"); goto done;
++    }
++    for (unsigned i = 0; i < sizeof(setup_saved) / sizeof(setup_saved[0]); ++i) setup_saved[i] = slider_read(se, setup_regs[i]);
++    configured = true;
++    /* Existing UniXNU/GF GENI FIFO setup for the qualified XO/DFS tuple. */
++    slider_write(se, 0x28, setup_saved[0] | 0x7f);
++    slider_write(se, 0x24, 0x7f);
++    slider_write(se, 0x20, 1);
++    slider_write(se, 0x7c, 0);
++    slider_write(se, GENI_CLK_CFG, 0x71);
++    const uint32_t counters = (10u << 20) | (11u << 10) | 26u;
++    slider_write(se, GENI_SCL_COUNTERS, counters);
++    if (slider_read(se, GENI_CLK_CFG) != 0x71 || slider_read(se, GENI_SCL_COUNTERS) != counters) {
++        printf("SLIDER probe skipped=timing-readback\n"); goto done;
+     }
+     idle = slider_identify(se);
+ done:
++    if (engine && configured && idle) {
++        for (unsigned i = 0; i < sizeof(setup_saved) / sizeof(setup_saved[0]); ++i) slider_write((void *)engine, setup_regs[i], setup_saved[i]);
++    }
++    if (pins_changed && idle) {
++        slider_write((void *)pins, 0, p4);
++        slider_write((void *)pins, 0x1000, p5);
++    }
+     if (engine) ml_io_unmap(engine, Window);
+-    if (vote_added && idle) slider_write((void *)votes, VoteReg, slider_read((void *)votes, VoteReg) & ~VoteS1);
++    if (added_votes && idle) slider_write((void *)votes, VoteReg, slider_read((void *)votes, VoteReg) & ~added_votes);
+     if (pins) ml_io_unmap(pins, Window);
+     if (votes) ml_io_unmap(votes, Window);
+     if (branches) ml_io_unmap(branches, Window);
+--- a/bsd/dev/KebabRpmhVrm.c
++++ b/bsd/dev/KebabRpmhVrm.c
+@@ -13,9 +13,11 @@
+ #include <string.h>
+ #endif
+ 
+-static const kebab_rpmh_resource kebab_resources[] = {
++/* First two entries stay fixed. Only ldoc10 is bound once from the firmware DB. */
++static kebab_rpmh_resource kebab_resources[] = {
+ 	{ "ldoa13", 0x00040d00u, 3008u },
+ 	{ "ldoc1",  0x00043000u, 1800u },
++	{ "ldoc10", 0, 3008u },
+ };
+ 
+ static uint32_t rd32(const uint8_t *p)
+@@ -51,7 +53,7 @@
+ 
+ 	for (i = 0; i < sizeof(kebab_resources) / sizeof(kebab_resources[0]);
+ 	    i++) {
+-		if (addr == kebab_resources[i].addr) {
++		if (addr && addr == kebab_resources[i].addr) {
+ 			return 1;
+ 		}
+ 	}
+@@ -124,6 +126,7 @@
+ 	for (i = 0; i < sizeof(kebab_resources) / sizeof(kebab_resources[0]);
+ 	    i++) {
+ 		res = &kebab_resources[i];
++		if (!res->addr) continue;
+ 		if (cmd->addr == res->addr + KEBAB_RPMH_REG_ENABLE) {
+ 			return cmd->data == 1u;
+ 		}
+@@ -150,6 +153,7 @@
+ 	}
+ 	for (i = 0; i < sizeof(kebab_resources) / sizeof(kebab_resources[0]);
+ 	    i++) {
++		if (!kebab_resources[i].addr) continue;
+ 		if (cmd->addr == kebab_resources[i].addr + KEBAB_RPMH_REG_ENABLE) {
+ 			return 1u << (i * 2u);
+ 		}
+@@ -179,6 +183,7 @@
+     const char *name, uint32_t *addr_out)
+ {
+ 	const kebab_rpmh_resource *expect = kebab_rpmh_resource_by_name(name);
++	const int bind_slider = expect && !expect->addr && strcmp(name, "ldoc10") == 0;
+ 	uint32_t i, j;
+ 	int found = 0;
+ 	uint32_t found_addr = 0;
+@@ -226,7 +231,10 @@
+ 			 * table address; a name pointing at another rail's
+ 			 * legal address is a cross-mapping, not a hit. */
+ 			if (slv != KEBAB_RPMH_ACCEL_VREG ||
+-			    rd32(db + e + 16u) != expect->addr) {
++			    (bind_slider ? ((rd32(db + e + 16u) & 0xffff00ffu) != 0x00040000u ||
++			        rd32(db + e + 16u) == kebab_resources[0].addr ||
++			        rd32(db + e + 16u) == kebab_resources[1].addr) :
++			        rd32(db + e + 16u) != expect->addr)) {
+ 				CMD_DB_TRACE("TOUCH41 db %s slot=%u slave=%u addr=%x expected=%x\n",
+ 				    name, i, slv, rd32(db + e + 16u), expect->addr);
+ 				return KEBAB_RPMH_ERR_ADDRESS;
+@@ -238,6 +246,8 @@
+ 	if (!found) {
+ 		return KEBAB_RPMH_ERR_RESOURCE;
+ 	}
++	/* Publish only after every entry was checked, including duplicate names. */
++	if (bind_slider) kebab_resources[2].addr = found_addr;
+ 	*addr_out = found_addr;
+ 	return KEBAB_RPMH_OK;
+ }

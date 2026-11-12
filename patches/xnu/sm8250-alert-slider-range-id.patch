@@ -1,0 +1,84 @@
+--- a/bsd/dev/Sm8250AlertSlider.c
++++ b/bsd/dev/Sm8250AlertSlider.c
+@@ -1,7 +1,8 @@
+ /* SPDX-License-Identifier: BSD-2-Clause-Patent */
+ /* IN2020 factory DTS i2c@984000; gcc-kona.c wrap0 S1; pinctrl-kona.c GPIO4/5.
+  * Discovery only: no sensor configuration writes. L10 is qualified and
+- * brought up with a 3008 mV vote followed by enable through the bounded RPMh sender.
++ * brought up with a 3008 mV vote; accept only the factory 3000..3312 mV
++ * interval, inside both candidate sensors' documented operating ranges.
+  * Called before the physical-key worker acquires the shared SPMI observer.
+  */
+ #include <kern/clock.h>
+@@ -27,6 +28,7 @@
+     Status = 0x40, Active = (1u << 0) | (1u << 12),
+     TxStatus = 0x800, GsiEnable = 0xe18,
+     L10Sid = 5, L10Base = 0x4900, L10Ppid = 0x549,
++    L10MinMv = 3000, L10MaxMv = 3312,
+     CommandDbPa = 0x80860000, CommandDbSize = 0x20000,
+     RscPa = 0x18220000, RscTcsBase = 0xd00, RscTcsStride = 0x2a0,
+ };
+@@ -123,14 +125,15 @@
+                 slider_pmic(match.apid, 0x46, &en);
+         }
+     }
+-    /* Actual IN2020 result is PMIC5 MV_P600_510 subtype 0x7d. Both stock
+-     * sensor variants and the factory ldoc10 constraints accept 3008 mV.
++    /* Actual IN2020 result is PMIC5 MV_P600_510 subtype 0x7d. MXM1120
++     * vendor range is 2700..3600 mV; iSentek specifies IST8801 1800..3600 mV.
++     * The narrower factory ldoc10 interval is 3000..3312 mV.
+      */
+     unsigned mv = ((unsigned)hi << 8) | lo;
+     bool ready = false;
+     printf("SLIDER rail-before ldoc10 ppid=%x matches=%u owner=%u read=%u type=%x/%x mv=%u en=%x\n",
+         (unsigned)L10Ppid, matches, match.write_ee, read, type, subtype, mv, en);
+-    if (!read || type != 4 || subtype != 0x7d || mv < 3000 || mv > 3312 || (en != 0 && en != 0x80) || !db || !rsc) goto out;
++    if (!read || type != 4 || subtype != 0x7d || mv < L10MinMv || mv > L10MaxMv || (en != 0 && en != 0x80) || !db || !rsc) goto out;
+     uint32_t address = 0;
+     const kebab_rpmh_status lookup = kebab_rpmh_cmd_db_lookup((const uint8_t *)db, CommandDbSize, "ldoc10", &address);
+     printf("SLIDER db ldoc10 lookup=%d addr=%x\n", lookup, address);
+@@ -143,8 +146,8 @@
+         (void *)(rsc + RscTcsBase + RscTcsStride)};
+     kebab_rpmh_tcs_init_global(&channel, io);
+     /* Do not change a rail another client has already enabled. */
+-    if (!en || mv != 3008) {
+-        if (en || !slider_send(&channel, false) ||
++    if (!en) {
++        if (!slider_send(&channel, false) ||
+             !slider_pmic(match.apid, 0x40, &lo) || !slider_pmic(match.apid, 0x41, &hi)) goto out;
+         mv = ((unsigned)hi << 8) | lo;
+         /* Vendor qcom-rpmh-regulator.c set_enable_state(): acknowledged
+@@ -155,19 +158,20 @@
+     }
+     if (!en && !slider_send(&channel, true)) goto out;
+     delay(20000);
+-    /* Accept identification only after a consistent enabled, target-voltage
+-     * observation. Keep reads bounded, and retain every final value on failure.
++    /* Accept an enabled supply only inside the sourced board/sensor interval.
++     * An ACK is not proof of an exact voltage; report the actual setting.
+      */
+     for (unsigned tries = 0; tries < 21; ++tries) {
+         const bool observed = slider_pmic(match.apid, 0x46, &en) &&
+             slider_pmic(match.apid, 0x40, &lo) && slider_pmic(match.apid, 0x41, &hi);
+         mv = ((unsigned)hi << 8) | lo;
+-        ready = observed && en == 0x80 && mv == 3008;
++        ready = observed && en == 0x80 && mv >= L10MinMv && mv <= L10MaxMv;
+         if (ready || !observed) break;
+         if (tries < 20) delay(1000);
+     }
+ out:
+-    printf("SLIDER rail-after mv=%u en=%x ready=%u\n", mv, en, ready);
++    printf("SLIDER rail-after requested=3008 mv=%u en=%x range=%u..%u exact=%u ready=%u\n",
++        mv, en, (unsigned)L10MinMv, (unsigned)L10MaxMv, mv == 3008, ready);
+     if (rsc) ml_io_unmap(rsc, Window);
+     if (db) ml_io_unmap(db, CommandDbSize);
+     if (spmi.obsrvr) ml_io_unmap(spmi.obsrvr, KEBAB_SPMI_OBSRV_SIZE);
+@@ -257,7 +261,7 @@
+ {
+     unsigned enabled = 0;
+     if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || enabled != 1) return;
+-    printf("SLIDER probe begin mode=enable-id\n");
++    printf("SLIDER probe begin mode=range-id\n");
+     vm_offset_t branches = ml_io_map_unmappable(GccBranch, Window, VM_WIMG_IO);
+     vm_offset_t votes = ml_io_map_unmappable(GccVotes, Window, VM_WIMG_IO);
+     vm_offset_t pins = ml_io_map_unmappable(Pins4, Window, VM_WIMG_IO);

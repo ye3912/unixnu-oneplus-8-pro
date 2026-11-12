@@ -1,0 +1,33 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1314,6 +1314,20 @@
+ } smufs_data_state;
+ 
+ static unsigned smufs_aks_fresh_data;
++/* This board's no-passcode fixture can use a verified persistent overlay.
++ * This latch attests mount completion, not passcode state or Data contents.
++ * Persistent use is an explicit board policy; it provides no key operations. */
++static unsigned smufs_aks_mounted_data;
++int
++smufs_aks_data_ready(void)
++{
++ uint32_t state=__atomic_load_n(&native_data_persist_state,__ATOMIC_ACQUIRE);
++ unsigned enabled=0;
++ if(__atomic_load_n(&smufs_aks_mounted_data,__ATOMIC_ACQUIRE)!=1)return 0;
++ if(state==0)return 1;
++ return (state==2 || state==3) &&
++     PE_parse_boot_argn("sm8250-persist-no-passcode",&enabled,sizeof(enabled)) && enabled==1;
++}
+ int
+ smufs_aks_fresh_data_ready(void)
+ {
+@@ -1425,6 +1439,9 @@
+  if(d)kfree_data(d,sizeof(*d));
+  smufs_data_state.error=error;
+  if(!error && smufs_data_state.stage==5) {
++  __atomic_store_n(&smufs_aks_mounted_data,1,__ATOMIC_RELEASE);
++  printf("KEYSTATE-UFS mounted backend%u no-passcode-policy%d\n",
++      native_data_persist_state,smufs_aks_data_ready());
+   if(native_data_persist_state==0) {
+    __atomic_store_n(&smufs_aks_fresh_data,1,__ATOMIC_RELEASE);
+    printf("KEYSTATE36 verified factory RAM Data, state queries eligible\n");

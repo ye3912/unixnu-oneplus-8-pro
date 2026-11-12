@@ -1,0 +1,39 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1244,6 +1244,10 @@
+  return note;
+ }
+ 
++extern int native_sm8250_thermal_live_prepare(void);
++extern const char *native_sm8250_thermal_live_note(void);
++extern int native_sm8250_thermal_hid_prepare(void);
++extern const char *native_sm8250_thermal_hid_note(void);
+ extern const char *native_smufs_cpu_policy_note(void);
+ extern int native_smufs_boot_status_prepare(void);
+ extern const char *native_smufs_boot_status_note(void);
+@@ -1256,12 +1260,12 @@
+ {
+  static char note[4096];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3z prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s%s%s%s%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h4c prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s%s%s%s%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_smufs_watchdog_note(),native_smufs_cpu_policy_note(),native_smufs_boot_status_note(),smufs_watchdog_brk_note(),smufs_data_note(),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_sm8250_thermal_live_note(),native_smufs_watchdog_note(),native_smufs_cpu_policy_note(),native_smufs_boot_status_note(),smufs_watchdog_brk_note(),smufs_data_note(),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
+  return note;
+ }
+ 
+@@ -1474,6 +1478,10 @@
+   if(v->error)panic("SMUFS data-h3t prepare refused %s",smufs_data_note());
+   v->error=native_smufs_boot_status_prepare();
+   if(v->error)panic("SMUFS boot-status-h3x prepare refused errno%d %s",v->error,native_smufs_boot_status_note());
++  v->error=native_sm8250_thermal_live_prepare();
++  if(v->error)panic("SMUFS thermal-h4c live prepare refused errno%d %s",v->error,native_sm8250_thermal_live_note());
++  v->error=native_sm8250_thermal_hid_prepare();
++  if(v->error)printf("SMUFS thermal-h4c hid unavailable errno%d %s\n",v->error,native_sm8250_thermal_hid_note());
+   v->error=native_smufs_watchdog_prepare();
+   if(v->error)panic("SMUFS watchdog-h3v prepare refused errno%d %s",v->error,native_smufs_watchdog_note());
+   if(!smufs_cache_carrier_publish(v)){v->error=EAUTH;smufs_cache_probe_report("carrier-publication",v);}

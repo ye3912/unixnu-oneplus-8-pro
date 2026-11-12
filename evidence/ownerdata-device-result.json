@@ -1,0 +1,23 @@
+{
+  "image_sha256": "2316d4eec266c1138768e7427381d5750b7981a4cada3f622eefa346103c130e",
+  "log": "analysis/usb-cdc/unixnu-serial-20261112-224544-19080.log",
+  "log_sha256": "c94f1664e7237693d7897b3084ed1ac71a6bac4eff1481d9e0d2f6dc70996044",
+  "user_report": "设置正常进入",
+  "followup_report": "现在很卡；画面有撕裂，用户怀疑帧缓冲或垂直同步",
+  "persistent_data_observed": true,
+  "addon_install_observed": true,
+  "accelerator_registration_observed": true,
+  "backboardd_plugin_and_fence_observed": true,
+  "settings_open_user_confirmed": true,
+  "preferences_fence_in_this_capture": false,
+  "poster_crashes_remain": true,
+  "performance_accepted": false,
+  "presentation_correctness_accepted": false,
+  "evidence_lines": {
+    "mounted_data": [475, 476],
+    "addon_registration": [479, 480],
+    "backboardd_plugin_and_fence": [729, 732],
+    "poster_fences": [1080, 1083],
+    "poster_crashes": [1098, 1166]
+  }
+}

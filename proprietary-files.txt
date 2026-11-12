@@ -1,0 +1,32 @@
+# Firmware inputs: relative path under .cache/firmware | source | SHA-256 | consumer
+#
+# These stay out of Git. The build tree links .cache/firmware from this repository,
+# so every build uses the same files.
+#
+# Platform package (UEFI DXE drivers, uefiplat.cfg, RawFiles):
+#   extracted from the stock xbl partition of this device with WOA-Project/UEFIReader.
+#   xbl_a.img  sha256 555e3fea4252238cb013a16be844fbb797790a3df10ae366f9a8d2f43f918837
+#   output     instantnoodlep-uefi/BOOT.XF.3.2-00358-SM8250-1/
+#   The tree is unpacked from the 4 KiB-signed vendor image; names come from the
+#   vendor name table, which is off by one for two panel XMLs. Identify panel files by
+#   their <PanelName> and <HorizontalActive>, not by filename.
+#
+# Firmware device tree (appended to the boot image):
+#   oneplus8series-coloros16-ye3912-original-20261024145055-DTB.zip
+#   sha256 6eacadfc0853e76109b69b5eb134b61d079288423b34106c4710bf7e48b3992e
+#   dtb      base kona trees, board-id 0
+#   dtbo.img nine board overlays; entry 0 is 19811 (instantnoodlep)
+#   merged   instantnoodlep.dtb  sha256 74b114b184d6ba4125352b173f618e7ce235b3db459c34202fdb7135a9177dcb
+#
+# Root and userdata inputs are added when the OS image step runs.
+
+# Volatile factory Data seed: ye3912/apfs Actions run41785622896, original21H461 var.
+# External file ios/analysis/h3t/data-seed/data-21H461.dbr; not stored in Git.
+# encoded sha256 64b0b499b1be4e75271b5be97d2e93249ddedd18ec7fe03a2805e341062b76d1; logical bytes 268435456
+# logical sha256 d1f8b48b90134fd465abf2858ddd3933a689f0d2f89e1f9aab8f6a8c58485272; APFS volume UUID 8360D3EE-5075-4532-8DE3-138DC6044254
+# Consumer: --data-ramdisk, packed_data_ramdisk=true, typed NativeRamBlock, /private/var.
+
+# IN2020 A650 GMU firmware for alioth mode 7. Local build input, kept out of Git.
+# SM8250_A650_REFERENCE/a650_gmu.bin | OnePlus SM8250 vendor/firmware extraction in TheMuppets/proprietary_vendor_oneplus_sm8250-common at ecc6eeb7fef9baf2bf3c49059de097ba48102547 | df79fa8482fcc7587bb239b9c9e2b24bce4729893b990fe3f82b30da8175b01c | scripts/build-sm8250-a650.py
+# SM8250_A650_REFERENCE/a650_sqe.fw | OnePlus SM8250 vendor/firmware extraction in TheMuppets/proprietary_vendor_oneplus_sm8250-common at ecc6eeb7fef9baf2bf3c49059de097ba48102547 | b4c27420fd6a5c6b511b254cc0fad8cdd40eea38ceb3418f895a1084f4460487 | scripts/build-sm8250-a650.py
+# SM8250_A650_REFERENCE/a650_zap.elf | OnePlus SM8250 vendor/firmware extraction in TheMuppets/proprietary_vendor_oneplus_sm8250-common at ecc6eeb7fef9baf2bf3c49059de097ba48102547 | 2b0e2832c95b0fa911a121d79df5c907c231e40de27c1954a1ba74f9ec771637 | scripts/build-sm8250-a650.py

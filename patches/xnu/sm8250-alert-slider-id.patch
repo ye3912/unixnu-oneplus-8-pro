@@ -1,0 +1,261 @@
+--- a/bsd/dev/Sm8250Keys.c
++++ b/bsd/dev/Sm8250Keys.c
+@@ -15,6 +15,7 @@
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern void thread_terminate_self(void);
+ extern bool sm8250_buttons_publish(uint32_t mask);
++extern void sm8250_alert_slider_probe(void);
+ void sm8250_keys_start(void);
+ 
+ enum {KeyPollMs = 16, InvalidLimit = 8, SpmiCoreSpan = 0x2000};
+@@ -147,6 +148,7 @@
+ {
+     (void)unused;
+     (void)result;
++    sm8250_alert_slider_probe();
+     if (spmi.core || spmi.cnfg || spmi.obsrvr) {
+         printf("KEY46 failed stage=arbiter-in-use\n");
+         thread_terminate_self();
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -614,6 +614,7 @@
+ bsd/dev/Sm8250TouchProbe.c		standard
+ bsd/dev/Sm8250TouchEvents.c		standard
+ bsd/dev/Sm8250Keys.c		standard
++bsd/dev/Sm8250AlertSlider.c		standard
+ bsd/dev/KebabKeys.c		standard
+ bsd/dev/kebab_spmi_bus.c		standard
+ bsd/dev/KebabRpmhVrm.c		standard
+--- /dev/null
++++ b/bsd/dev/Sm8250AlertSlider.c
+@@ -0,0 +1,230 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* IN2020 factory DTS i2c@984000; gcc-kona.c wrap0 S1; pinctrl-kona.c GPIO4/5.
++ * Discovery only: no sensor register, PMIC voltage or rail-enable writes.
++ * Called before the physical-key worker acquires the shared SPMI observer.
++ */
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <vm/memory_types.h>
++#include "GeniI2c.h"
++#include "kebab_spmi_bus.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++void sm8250_alert_slider_probe(void);
++
++enum {
++    Window = 0x4000, SpmiCoreSpan = 0x2000,
++    GccBranch = 0x00117000, GccVotes = 0x00150000,
++    Se1 = 0x00984000, Pins4 = 0x0f904000,
++    VoteReg = 0x2008, VoteS1 = 1u << 11, VoteAhb = (1u << 6) | (1u << 7),
++    SeBranch = 0x13c, SeRoot = 0x140, MasterAhb = 4, SlaveAhb = 8,
++    Status = 0x40, Active = (1u << 0) | (1u << 12),
++    TxStatus = 0x800, GsiEnable = 0xe18,
++    L10Sid = 5, L10Base = 0x4900, L10Ppid = 0x549,
++};
++#define CLOCK_OFF (1u << 31)
++
++static uint32_t
++slider_read(void *ctx, uint32_t reg)
++{
++    return *(volatile uint32_t *)((uintptr_t)ctx + reg);
++}
++
++static void
++slider_write(void *ctx, uint32_t reg, uint32_t value)
++{
++    *(volatile uint32_t *)((uintptr_t)ctx + reg) = value;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++slider_poll_write(void *ctx, uint32_t reg, uint32_t value)
++{
++    /* This one-shot consumer polls; never enable a new interrupt route. */
++    if (reg != GENI_SE_IRQ_EN) slider_write(ctx, reg, value);
++}
++
++static bool
++slider_power_ready(void)
++{
++    if (spmi.core || spmi.cnfg || spmi.obsrvr || spmi.chnl_mapped) {
++        printf("SLIDER probe skipped=spmi-in-use\n");
++        return false;
++    }
++    spmi.core = ml_io_map_unmappable(KEBAB_SPMI_CORE_PA, SpmiCoreSpan, VM_WIMG_IO);
++    spmi.cnfg = ml_io_map_unmappable(KEBAB_SPMI_CNFG_PA, KEBAB_SPMI_CNFG_SIZE, VM_WIMG_IO);
++    spmi.obsrvr = ml_io_map_unmappable(KEBAB_SPMI_OBSRV_PA, KEBAB_SPMI_OBSRV_SIZE, VM_WIMG_IO);
++    struct kebab_spmi_match match = {0};
++    uint32_t matches = 0;
++    uint8_t type = 0, subtype = 0, lo = 0, hi = 0, en = 0;
++    bool read = false;
++    if (spmi.core && spmi.cnfg && spmi.obsrvr &&
++        kebab_spmi_version_known(kebab_spmi_rd(spmi.core, KEBAB_SPMI_VERSION))) {
++        matches = kebab_spmi_scan(L10Ppid, &match, 1);
++        if (matches == 1 && match.write_ee == 4) {
++            read = kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 4, 1, false, true, &type) == 0 &&
++                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 5, 1, false, true, &subtype) == 0 &&
++                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 0x40, 1, false, true, &lo) == 0 &&
++                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 0x41, 1, false, true, &hi) == 0 &&
++                kebab_spmi_obs_read_ex(match.apid, L10Sid, L10Base + 0x46, 1, false, true, &en) == 0;
++        }
++    }
++    /* Known PMIC5 510 LDO layouts, as used by the existing qualified touch path.
++     * Factory ldoc10 bounds are 3,000,000..3,312,000 uV; retain firmware voltage.
++     */
++    const unsigned mv = ((unsigned)hi << 8) | lo;
++    const bool ready = read && type == 4 && (subtype == 0x71 || subtype == 0x7b) &&
++        mv >= 3000 && mv <= 3312 && en == 0x80;
++    printf("SLIDER rail ldoc10 ppid=%x matches=%u owner=%u read=%u type=%x/%x mv=%u en=%x ready=%u writes=0\n",
++        (unsigned)L10Ppid, matches, match.write_ee, read, type, subtype, mv, en, ready);
++    if (spmi.obsrvr) ml_io_unmap(spmi.obsrvr, KEBAB_SPMI_OBSRV_SIZE);
++    if (spmi.cnfg) ml_io_unmap(spmi.cnfg, KEBAB_SPMI_CNFG_SIZE);
++    if (spmi.core) ml_io_unmap(spmi.core, SpmiCoreSpan);
++    spmi.core = spmi.cnfg = spmi.obsrvr = 0;
++    return ready;
++}
++
++static int
++slider_wait(GeniI2c *bus)
++{
++    for (unsigned window = 0; window < 3; ++window) {
++        for (unsigned us = 0; us < 20000; us += 10) {
++            const int state = geni_i2c_poll(bus);
++            if (state != GeniPending) return state;
++            delay(10);
++        }
++        geni_i2c_timeout(bus);
++    }
++    return GeniFailed;
++}
++
++static bool
++slider_idle(void *se)
++{
++    if (!(slider_read(se, Status) & Active)) return true;
++    slider_write(se, GENI_M_CMD_CTRL, GENI_CMD_CTRL_ABORT);
++    for (unsigned us = 0; us < 20000; us += 10) {
++        if (!(slider_read(se, Status) & Active)) {
++            const uint32_t irq = slider_read(se, GENI_M_IRQ_STATUS);
++            slider_write(se, GENI_M_IRQ_CLEAR, irq);
++            return true;
++        }
++        delay(10);
++    }
++    return false;
++}
++
++static bool
++slider_identify(void *se)
++{
++    static const uint32_t registers[] = {
++        GENI_DMA_MODE, GENI_TX_PACK0, GENI_TX_PACK1, GENI_RX_PACK0, GENI_RX_PACK1,
++        GENI_BYTE_GRAN, GENI_TX_LEN, GENI_RX_LEN, GENI_M_IRQ_EN,
++    };
++    uint32_t saved[sizeof(registers) / sizeof(registers[0])];
++    for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); ++i) saved[i] = slider_read(se, registers[i]);
++    const GeniIo io = {slider_read, slider_poll_write, se};
++    static const uint8_t addresses[] = {0x0c, 0x0d, 0x18, 0x19};
++    uint8_t id[4] = {0};
++    bool valid[4] = {false};
++    bool idle = true;
++    for (unsigned i = 0; i < 4 && idle; ++i) {
++        GeniI2c bus;
++        uint32_t config = 0;
++        const int prepared = geni_i2c_prepare(&bus, &io, addresses[i], &config);
++        int state = GeniFailed;
++        if (prepared == 0 && geni_i2c_start_read(&bus, 0x09) == 0) state = slider_wait(&bus);
++        valid[i] = prepared == 0 && state == GeniDone;
++        if (valid[i]) id[i] = bus.data;
++        idle = slider_idle(se);
++        printf("SLIDER id addr=%02x prepared=%d state=%d value=%02x valid=%u error=%u irq=%x idle=%u\n",
++            addresses[i], prepared, state, id[i], valid[i], bus.error, bus.error_status, idle);
++        /* A failing controller qualification is not evidence for another chip. */
++        if (prepared != 0) break;
++    }
++    const bool mxm = valid[0] && valid[1] && id[0] == 0x9c && id[1] == 0x9c;
++    const bool ist = valid[2] && valid[3] && id[2] == 0x81 && id[3] == 0x81;
++    printf("SLIDER pair mxm1120=%u ist8801=%u selected=%s sensor-writes=0\n",
++        mxm, ist, mxm != ist ? (mxm ? "mxm1120" : "ist8801") : "unresolved");
++    bool restored = false;
++    if (idle) {
++        slider_write(se, GENI_M_IRQ_CLEAR, slider_read(se, GENI_M_IRQ_STATUS));
++        for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); ++i) slider_write(se, registers[i], saved[i]);
++        restored = true;
++        for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); ++i) {
++            if (slider_read(se, registers[i]) != saved[i]) restored = false;
++        }
++    }
++    printf("SLIDER controller idle=%u restored=%u\n", idle, restored);
++    return idle;
++}
++
++void
++sm8250_alert_slider_probe(void)
++{
++    unsigned enabled = 0;
++    if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || enabled != 1) return;
++    printf("SLIDER probe begin mode=id\n");
++    vm_offset_t branches = ml_io_map_unmappable(GccBranch, Window, VM_WIMG_IO);
++    vm_offset_t votes = ml_io_map_unmappable(GccVotes, Window, VM_WIMG_IO);
++    vm_offset_t pins = ml_io_map_unmappable(Pins4, Window, VM_WIMG_IO);
++    vm_offset_t engine = 0;
++    bool vote_added = false, idle = true;
++    if (!branches || !votes || !pins) {printf("SLIDER probe skipped=map\n"); goto done;}
++    const uint32_t vote = slider_read((void *)votes, VoteReg);
++    const uint32_t ma = slider_read((void *)branches, MasterAhb);
++    const uint32_t sa = slider_read((void *)branches, SlaveAhb);
++    uint32_t cb = slider_read((void *)branches, SeBranch);
++    const uint32_t cfg = slider_read((void *)branches, SeRoot + 4);
++    const uint32_t dfs = slider_read((void *)branches, SeRoot + 0x14);
++    printf("SLIDER clocks vote=%x m=%x s=%x se=%x cfg=%x dfs=%x\n", vote, ma, sa, cb, cfg, dfs);
++    const uint32_t p4 = slider_read((void *)pins, 0), p5 = slider_read((void *)pins, 0x1000);
++    const uint32_t sda = slider_read((void *)pins, 4), scl = slider_read((void *)pins, 0x1004);
++    printf("SLIDER pins gpio4=%x gpio5=%x sda=%x scl=%x\n", p4, p5, sda, scl);
++    const bool rail = slider_power_ready();
++    /* Retain the firmware's selected mux and timing; qualification never changes
++     * clock roots or drives released GPIO pins as outputs.
++     */
++    if ((vote & VoteAhb) != VoteAhb || (ma & CLOCK_OFF) ||
++        ((sa & CLOCK_OFF) && !(sa & 2))) {printf("SLIDER probe skipped=ahb\n"); goto done;}
++    if (!rail) {printf("SLIDER probe skipped=rail\n"); goto done;}
++    if ((p4 & 0x23c) != 4 || (p5 & 0x23c) != 4 || !(sda & scl & 1)) {
++        printf("SLIDER probe skipped=pin-state\n"); goto done;
++    }
++    if (!(vote & VoteS1)) {
++        slider_write((void *)votes, VoteReg, vote | VoteS1);
++        vote_added = true;
++    }
++    for (unsigned tries = 0; tries < 200; ++tries) {
++        cb = slider_read((void *)branches, SeBranch);
++        if (!(cb & CLOCK_OFF)) break;
++        delay(10);
++    }
++    if (cb & CLOCK_OFF) {printf("SLIDER probe skipped=se-clock\n"); goto done;}
++    engine = ml_io_map_unmappable(Se1, Window, VM_WIMG_IO);
++    if (!engine) {printf("SLIDER probe skipped=engine-map\n"); goto done;}
++    void *se = (void *)engine;
++    const uint32_t fw = slider_read(se, GENI_FW_REVISION), state = slider_read(se, Status);
++    const uint32_t irq = slider_read(se, GENI_M_IRQ_STATUS), route = slider_read(se, GENI_SE_IRQ_EN);
++    const uint32_t clock = slider_read(se, GENI_CLK_CFG), timing = slider_read(se, GENI_SCL_COUNTERS);
++    /* An engine already active at handoff is not ours to stop or clock off. */
++    idle = !(state & Active);
++    printf("SLIDER engine fw=%x state=%x irq=%x route=%x clock=%x timing=%x\n", fw, state, irq, route, clock, timing);
++    if (((fw >> 8) & 0xff) != GENI_PROTO_I2C || (state & Active) || irq ||
++        (route & GENI_SE_M_IRQ_EN) || slider_read(se, GsiEnable) ||
++        (slider_read(se, GENI_IF_DISABLE) & 1) || (slider_read(se, GENI_DMA_MODE) & 1) ||
++        (slider_read(se, TxStatus) & 0xfffffff) || (slider_read(se, GENI_RX_FIFO_STATUS) & 0x1ffffff) ||
++        slider_read(se, GENI_TX_WATERMARK) || !(clock & 1) || !timing) {
++        printf("SLIDER probe skipped=engine-state\n"); goto done;
++    }
++    idle = slider_identify(se);
++done:
++    if (engine) ml_io_unmap(engine, Window);
++    if (vote_added && idle) slider_write((void *)votes, VoteReg, slider_read((void *)votes, VoteReg) & ~VoteS1);
++    if (pins) ml_io_unmap(pins, Window);
++    if (votes) ml_io_unmap(votes, Window);
++    if (branches) ml_io_unmap(branches, Window);
++    printf("SLIDER probe end idle=%u\n", idle);
++}

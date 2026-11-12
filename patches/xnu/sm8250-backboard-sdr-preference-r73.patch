@@ -1,0 +1,60 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1683,6 +1683,45 @@
+ }
+ extern int sm8250_alioth_metal_register(void);
+ 
++/* The original CA reads a Boolean in backboardd's application domain.
++ * This verified factory RAM Data seed has no existing backboardd preferences. */
++static void
++sm8250_backboard_sdr_preference(uint64_t scratch, vfs_context_t ctx)
++{
++    static const char path[] = "/private/var/mobile/Library/Preferences/com.apple.backboardd.plist";
++    static const char plist[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
++        "<plist version=\"1.0\"><dict><key>CAEnableDeepFramebuffer</key><false/></dict></plist>";
++    unsigned enabled = 0;
++    if (!PE_parse_boot_argn("smgop", &enabled, sizeof(enabled)) || enabled != 1) return;
++
++    vnode_t file = NULLVP;
++    int error = vnode_open(path, FWRITE | O_CREAT | O_EXCL | O_NOFOLLOW, 0600,
++        VNODE_LOOKUP_NOFOLLOW, &file, ctx);
++    if (!error) {
++        struct vnode_attr attr;
++        VATTR_INIT(&attr);
++        VATTR_SET(&attr, va_uid, 501);
++        VATTR_SET(&attr, va_gid, 501);
++        error = vnode_setattr(file, &attr, ctx);
++        int residual = 0;
++        if (!error) {
++            error = vn_rdwr(UIO_WRITE, file, (caddr_t)(uintptr_t)plist, sizeof(plist) - 1,
++                0, UIO_SYSSPACE, IO_UNIT, vfs_context_ucred(ctx), &residual, vfs_context_proc(ctx));
++            if (!error && residual) error = EIO;
++        }
++        int closed = vnode_close(file, FWRITE, ctx);
++        if (!error) error = closed;
++        if (error) {
++            struct unlink_args args = {.path = scratch + 0xe00};
++            int32_t result = 0;
++            if (!copyout(path, args.path, sizeof(path))) {
++                (void)unlink(current_proc(), &args, &result);
++            }
++        }
++    }
++    printf("SMGOP73 SDR preference status=%d\n", error);
++}
++
+ static void
+ sm8250_metal_addon_prepare(uint64_t scratch, vfs_context_t ctx)
+ {
+@@ -1762,7 +1801,10 @@
+         error = native_gpu_addon_error ? native_gpu_addon_error : EIO;
+         goto done;
+     }
+-    if (metal) sm8250_metal_addon_prepare(scratch, ctx);
++    if (metal) {
++        sm8250_backboard_sdr_preference(scratch, ctx);
++        sm8250_metal_addon_prepare(scratch, ctx);
++    }
+     stage = 3;
+     error = kernel_mount("bindfs", NULLVP, NULLVP, target, (void *)source, sizeof(source), flags, 0, ctx);
+     if (error) goto done;

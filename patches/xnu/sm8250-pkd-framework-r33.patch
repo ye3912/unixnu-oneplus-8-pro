@@ -1,0 +1,84 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1497,6 +1497,72 @@
+  return error;
+ }
+ 
++/* R33: expose the verified original SystemOS framework to its normal path. */
++__attribute__((noinline)) static int
++smufs_pkd_framework_prepare(struct SmUfsCacheProbe *cache)
++{
++ static const char source[]="/private/preboot/System/Library/PrivateFrameworks/PlugInKitDaemon.framework";
++ static const char target[]="/System/Library/PrivateFrameworks/PlugInKitDaemon.framework";
++ static const uint8_t expected[32]={0x72,0x50,0x6a,0x55,0xad,0x0d,0x28,0x2f,0xf8,0xc1,0xdb,0x31,0x27,0xc3,0x36,0x22,0x21,0xa1,0x17,0x09,0x75,0x98,0x9a,0xc9,0xb6,0x33,0xbf,0x73,0xad,0xe4,0x39,0x52};
++ const int flags=MNT_RDONLY|MNT_UNION|MNT_NOSUID|MNT_NODEV;
++ vnode_t root=rootvnode;
++ mount_t root_mount=vnode_mount(root);
++ vfs_context_t ctx=vfs_context_kernel();
++ vnode_t upper=NULLVP,lower=NULLVP,visible=NULLVP,backing=NULLVP,file=NULLVP;
++ vnode_t old_info=NULLVP,new_info=NULLVP;
++ char path[MAXPATHLEN];
++ unsigned stage=1;
++ int error;
++
++ if(proc_getpid(current_proc())!=1 || !cache || cache->mode!=3 || cache->original_root!=root ||
++  !smufs_cache_root_valid() || !smufs_cache_integrity_valid(cache,1) || !cache->readonly ||
++  !cache->system_mount || cache->system_mount==root_mount || !(vfs_flags(root_mount)&MNT_RDONLY))return EAUTH;
++ error=vnode_lookup(source,VNODE_LOOKUP_NOFOLLOW,&upper,ctx);
++ if(!error && (!vnode_isdir(upper) || vnode_mount(upper)!=cache->system_mount))error=EAUTH;
++ if(!error)error=vnode_lookup(target,VNODE_LOOKUP_NOFOLLOW,&lower,ctx);
++ if(!error && (!vnode_isdir(lower) || vnode_mount(lower)!=root_mount))error=EAUTH;
++ snprintf(path,sizeof(path),"%s/Info.plist",target);
++ if(!error)error=vnode_lookup(path,VNODE_LOOKUP_NOFOLLOW,&old_info,ctx);
++ if(!error && (!vnode_isreg(old_info) || vnode_mount(old_info)!=root_mount))error=EAUTH;
++ snprintf(path,sizeof(path),"%s/PlugInKitDaemon",source);
++ if(!error)error=smufs_library_verify(path,cache->system_mount,302496,expected);
++ if(!error) {
++  stage=2;
++  error=kernel_mount("bindfs",NULLVP,NULLVP,target,(void *)source,sizeof(source),flags,0,ctx);
++ }
++ if(!error) {
++  stage=3;
++  error=vnode_lookup(target,VNODE_LOOKUP_NOFOLLOW,&visible,ctx);
++ }
++ if(!error && (strcmp(vfs_statfs(vnode_mount(visible))->f_fstypename,"bindfs") ||
++   (vfs_flags(vnode_mount(visible))&flags)!=(uint64_t)flags))error=EAUTH;
++ if(!error)error=bindfs_getbackingvnode(visible,&backing);
++ if(!error && backing!=upper)error=EAUTH;
++ if(backing){vnode_put(backing);backing=NULLVP;}
++ if(!error) {
++  stage=4;
++  snprintf(path,sizeof(path),"%s/PlugInKitDaemon",target);
++  error=vnode_lookup(path,VNODE_LOOKUP_NOFOLLOW,&file,ctx);
++ }
++ if(!error && vnode_mount(file)!=vnode_mount(visible))error=EAUTH;
++ if(!error)error=bindfs_getbackingvnode(file,&backing);
++ snprintf(path,sizeof(path),"%s/Info.plist",target);
++ if(!error)error=vnode_lookup(path,VNODE_LOOKUP_NOFOLLOW,&new_info,ctx);
++ if(!error && (!vnode_isreg(backing) || vnode_mount(backing)!=cache->system_mount ||
++   new_info!=old_info ||
++   rootvnode!=root || vnode_mount(rootvnode)!=root_mount || !smufs_cache_root_valid() ||
++   !smufs_cache_integrity_valid(cache,1)))error=EAUTH;
++ if(new_info)vnode_put(new_info);
++ if(old_info)vnode_put(old_info);
++ if(backing)vnode_put(backing);
++ if(file)vnode_put(file);
++ if(visible)vnode_put(visible);
++ if(lower)vnode_put(lower);
++ if(upper)vnode_put(upper);
++ printf("PKFRAME33 stage%u errno%d verified%u\n",stage,error,error?0U:1U);
++ return error;
++}
++
+ __attribute__((noinline)) uint64_t
+ native_smufs_cache_prepare(uint64_t scratch)
+ {
+@@ -1570,6 +1636,8 @@
+   if(!native_smufs_bootset_publish((uint32_t)rootdev,v->selected,smufs_saved_autherr,v->media)){v->error=EAUTH;smufs_cache_probe_report("bootset-publication",v);}
+   v->error=smufs_cryptex_libraries_prepare(v);
+   if(v->error)panic("SMULIB23 original library namespace refused errno%d",v->error);
++  v->error=smufs_pkd_framework_prepare(v);
++  if(v->error)panic("PKFRAME33 original framework namespace refused errno%d",v->error);
+   v->error=smufs_data_prepare(scratch,v);
+   if(v->error)panic("SMUFS data-h3t prepare refused %s",smufs_data_note());
+   v->error=native_smufs_boot_status_prepare();

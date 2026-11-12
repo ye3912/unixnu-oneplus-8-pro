@@ -1,0 +1,28 @@
+version = 1
+[boot]
+timeout = 3
+default = "xnu"
+[kits]
+autoload = false
+[[entry]]
+id = "xnu"
+title = "UniXNU"
+type = "xnu"
+path = "Payloads/kernel.macho"
+initrd = "Payloads/scratch-data.img"
+args = "-v serial=3 debug=0x14e sheng-pmgr=2 native-ufs-probe=70 native-ufs-root=2 native-ufs-windows=1 native-ufs-root-match-only=0 native-ufs-auth-diag=1 native-ufs-owner-audit=1 native-ufs-owner-trust=1 native-ufs-init-diag=0 native-ufs-cache-probe=3 smgop=1 offline-legacy-gop=1 offline-legacy-register=1 offline-legacy-phase=4 offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-retire=1 offline-legacy-cpu-present=1 sheng-vsync=60 qcom-usb-debug=1 qcom-usb-prepare=1 -enable_kprintf_spam gui-exit-diag=1 gui-wait-diag=0 offline-key-events=1 plugin-ipc-diag=1 sm8250-touch-probe=4 sheng-touch-hid=1 sheng-buttons=1 sm8250-wallpaper-png=1 sm8250-gpu-ro=1 sm8250-gpu-alioth=12 sheng-smp=1 sheng-smp-core=1 armcpu-redist-ipi=1 armcpu-self-ipi=1 cpumask=0xff sm8250-ep-read=1 sm8250-ep-vote=1 sheng-data-persist=2 sm8250-persist-no-passcode=1 sm8250-slider-probe=4 sheng-fb-gpu=1 sheng-early-retire=1"
+[[entry]]
+id = "reset"
+title = "Restart"
+type = "action"
+action = "reset"
+[[entry]]
+id = "shutdown"
+title = "Power off"
+type = "action"
+action = "shutdown"
+[[entry]]
+id = "tools"
+title = "Tools"
+type = "action"
+action = "tools"

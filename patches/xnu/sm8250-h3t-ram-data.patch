@@ -1,0 +1,156 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1175,17 +1175,19 @@
+      smufs_tz_symlink.slot[selected].source,smufs_tz_symlink.slot[selected].link);return note;
+ }
+ 
++static const char *smufs_data_note(void);
++
+ __attribute__((noinline)) const char *
+ native_smufs_cache_panic_note(void)
+ {
+- static char note[2304];
++ static char note[2688];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3s prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3t prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),smufs_data_note(),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
+  return note;
+ }
+ 
+@@ -1208,6 +1210,121 @@
+        v->system_flags,v->system_selftests,(unsigned long long)v->system_checked,(unsigned long long)v->system_bad,
+        v->mode!=3,(v->mode==2 || v->mode==3) && v->system_flags==15 && !v->system_bad,v->mode==3?native_smufs_bootset_note():"");
+ }
++/* Board-only writable RAM Data. Initial seed identity is independent of root
++ * authentication; mutable Data does not claim signed immutable integrity.
++ */
++extern int native_ram_block_volume_seed(const char *,dev_t *,char *,size_t,uint64_t *,uint64_t *,uint8_t[32]);
++extern volatile uint32_t native_data_persist_state;
++static const char smufs_data_uuid[]="8360D3EE-5075-4532-8DE3-138DC6044254";
++static const uint8_t smufs_data_expected_hash[32]={0xd1,0xf8,0xb4,0x8b,0x90,0x13,0x4f,0xd4,0x65,0xab,0xf2,0x85,0x8d,0xdd,0x39,0x33,0xa6,0x89,0xf0,0xd2,0xf8,0x9e,0x1f,0x9a,0xab,0x8f,0x6a,0x8c,0x58,0x48,0x52,0x72};
++static struct {
++ uint32_t stage,selected,mounted,readonly,apfs,seed_ok,rebound,root_same,path_bound;
++ uint32_t mount_enter,mount_return;
++ int error;
++ uint64_t bytes;
++ char device[64];
++} smufs_data_state;
++
++static int
++smufs_data_seed_matches(uint32_t device,uint64_t bytes,const uint8_t hash[32],
++    uint32_t os_device,uint32_t system_device)
++{
++ return device!=0xffffffffU && device!=os_device && device!=system_device &&
++        bytes==UINT64_C(268435456) && !memcmp(hash,smufs_data_expected_hash,32);
++}
++
++__attribute__((noinline)) static const char *
++smufs_data_note(void)
++{
++ static char note[304];
++ snprintf(note,sizeof(note),"data stage%u errno%d seed%u rebound%u bytes%llu volatile%u\n"
++     "data selected%x mounted%x ro%u apfs%u root-same%u timezone%u mount%u/%u path=%s\n",
++     smufs_data_state.stage,smufs_data_state.error,smufs_data_state.seed_ok,smufs_data_state.rebound,
++     (unsigned long long)smufs_data_state.bytes,native_data_persist_state==0,
++     smufs_data_state.selected,smufs_data_state.mounted,smufs_data_state.readonly,smufs_data_state.apfs,
++     smufs_data_state.root_same,smufs_data_state.path_bound,smufs_data_state.mount_enter,
++     smufs_data_state.mount_return,smufs_data_state.device);
++ return note;
++}
++
++__attribute__((noinline)) static int
++smufs_data_prepare(uint64_t scratch,struct SmUfsCacheProbe *cache)
++{
++ struct DataPrep {
++  uint8_t payload[0x150],hash[32],posthash[32];
++  char postpath[64];
++ } *d=kalloc_data(sizeof(*d),Z_WAITOK|Z_ZERO);
++ vnode_t data_root=NULLVP,timezone=NULLVP;
++ uint64_t base=0,bytes=0,postbase=0,postbytes=0;
++ dev_t selected=NODEV,fresh=NODEV;
++ mount_t data_mount=NULL;
++ int error=ENOMEM;
++ smufs_data_state.stage=1;smufs_data_state.selected=smufs_data_state.mounted=0xffffffffU;
++ if(!d)goto done;
++ error=EAUTH;
++ if(proc_getpid(current_proc())!=1 || !scratch || scratch>~(uint64_t)0-0x600 ||
++    rootvnode!=cache->original_root || !smufs_cache_root_valid() || !cache->readonly ||
++    !cache->system_mount || !(vfs_flags(cache->system_mount)&MNT_RDONLY) ||
++    !smufs_cache_integrity_valid(cache,1) || native_data_persist_state)goto done;
++ if(!native_ram_block_volume_seed(smufs_data_uuid,&selected,smufs_data_state.device,
++      sizeof(smufs_data_state.device),&base,&bytes,d->hash)){error=ENOENT;goto done;}
++ smufs_data_state.selected=(uint32_t)selected;smufs_data_state.bytes=bytes;
++ if(!smufs_data_seed_matches((uint32_t)selected,bytes,d->hash,(uint32_t)rootdev,cache->selected) ||
++    strncmp(smufs_data_state.device,"/dev/disk",9) || native_data_persist_state){error=EAUTH;goto done;}
++ smufs_data_state.seed_ok=1;smufs_data_state.stage=2;
++ error=vnode_lookup("/private/var",0,&data_root,vfs_context_current());
++ if(error)goto done;
++ if(vnode_vtype(data_root)!=VDIR || vnode_mount(data_root)!=vnode_mount(rootvnode)){error=EBUSY;goto done;}
++ vnode_put(data_root);data_root=NULLVP;
++ user64_addr_t spec=scratch+0x160;
++ uint16_t mode=1;uint32_t anonymous=99;
++ memcpy(d->payload,&spec,sizeof(spec));memcpy(d->payload+16,&mode,sizeof(mode));
++ memcpy(d->payload+0x144,&anonymous,4);memcpy(d->payload+0x148,&anonymous,4);
++ struct mount_args request={.type=scratch+0x100,.path=scratch+0x120,.flags=0,.data=scratch+0x200};
++ int32_t result=0;
++ if((error=copyout("apfs",request.type,5)) ||
++    (error=copyout("/private/var",request.path,sizeof("/private/var"))) ||
++    (error=copyout(smufs_data_state.device,spec,strlen(smufs_data_state.device)+1)) ||
++    (error=copyout(d->payload,request.data,sizeof(d->payload))))goto done;
++ smufs_data_state.stage=3;smufs_data_state.mount_enter=1;
++ error=mount(current_proc(),&request,&result);smufs_data_state.mount_return=1;
++ if(error)goto done;
++ smufs_data_state.stage=4;
++ error=vnode_lookup("/private/var",0,&data_root,vfs_context_current());
++ if(error)goto done;
++ data_mount=vnode_mount(data_root);
++ if(!data_mount){error=EINVAL;goto done;}
++ vnode_t device=vfs_devvp(data_mount);
++ smufs_data_state.mounted=device?(uint32_t)vnode_specrdev(device):0xffffffffU;
++ if(device)vnode_put(device);
++ smufs_data_state.readonly=(vfs_flags(data_mount)&MNT_RDONLY)!=0;
++ smufs_data_state.apfs=!strcmp(vfs_statfs(data_mount)->f_fstypename,"apfs");
++ smufs_data_state.root_same=rootvnode==cache->original_root;
++ if(smufs_data_state.readonly || !smufs_data_state.apfs || smufs_data_state.mounted!=(uint32_t)selected ||
++    data_mount==cache->system_mount || data_mount==vnode_mount(rootvnode) ||
++    !smufs_data_state.root_same || !smufs_cache_root_valid() ||
++    !(vfs_flags(cache->system_mount)&MNT_RDONLY) || !smufs_cache_integrity_valid(cache,1)){
++  error=EAUTH;goto done;
++ }
++ smufs_data_state.rebound=native_ram_block_volume_seed(smufs_data_uuid,&fresh,d->postpath,
++    sizeof(d->postpath),&postbase,&postbytes,d->posthash) && fresh==selected && postbytes==bytes &&
++    !strcmp(d->postpath,smufs_data_state.device) &&
++    smufs_data_seed_matches((uint32_t)fresh,postbytes,d->posthash,(uint32_t)rootdev,cache->selected);
++ if(!smufs_data_state.rebound || native_data_persist_state){error=EAUTH;goto done;}
++ error=vnode_lookup("/var/db/timezone",0,&timezone,vfs_context_current());
++ if(error)goto done;
++ smufs_data_state.path_bound=vnode_vtype(timezone)==VDIR && vnode_mount(timezone)==data_mount;
++ if(!smufs_data_state.path_bound){error=EXDEV;goto done;}
++ smufs_data_state.stage=5;
++done:
++ if(timezone)vnode_put(timezone);
++ if(data_root)vnode_put(data_root);
++ if(d)kfree_data(d,sizeof(*d));
++ smufs_data_state.error=error;
++ if(!error)printf("SMUFS data-h3t prepared %s",smufs_data_note());
++ return error;
++}
++
+ __attribute__((noinline)) uint64_t
+ native_smufs_cache_prepare(uint64_t scratch)
+ {
+@@ -1279,6 +1396,8 @@
+   v->root_same=rootvnode==v->original_root;v->root_after=smufs_cache_root_valid();
+   if(!v->root_same||!v->root_after||!smufs_cache_integrity_valid(v,1)){v->error=EAUTH;smufs_cache_probe_report("continue-policy",v);}
+   if(!native_smufs_bootset_publish((uint32_t)rootdev,v->selected,smufs_saved_autherr,v->media)){v->error=EAUTH;smufs_cache_probe_report("bootset-publication",v);}
++  v->error=smufs_data_prepare(scratch,v);
++  if(v->error)panic("SMUFS data-h3t prepare refused %s",smufs_data_note());
+   if(!smufs_cache_carrier_publish(v)){v->error=EAUTH;smufs_cache_probe_report("carrier-publication",v);}
+   v->error=native_smufs_cache_prepare_stdio();
+   if(v->error)smufs_cache_probe_report("init-stdio",v);

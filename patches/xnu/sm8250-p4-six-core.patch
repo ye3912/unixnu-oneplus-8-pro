@@ -1,0 +1,51 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1662,7 +1662,8 @@
+     uint64_t cpumask = 0;
+     bool have_mask = PE_parse_boot_argn("cpumask", &cpumask, sizeof(cpumask)) != 0;
+     int last_secondary = 1;
+-    if (have_mask && (cpumask == 0x13 || cpumask == 0x93 || cpumask == 0xd3) &&
++    if (have_mask &&
++        (cpumask == 0x13 || cpumask == 0x93 || cpumask == 0xd3 || cpumask == 0xf3) &&
+         ml_get_cpu_number(0x100) == 1 && ml_get_cpu_number(0x400) == 2) {
+         if (cpumask == 0x13) {
+             last_secondary = 2;
+@@ -1671,6 +1672,9 @@
+         } else if (cpumask == 0xd3 &&
+             ml_get_cpu_number(0x600) == 3 && ml_get_cpu_number(0x700) == 4) {
+             last_secondary = 4;
++        } else if (cpumask == 0xf3 && ml_get_cpu_number(0x500) == 3 &&
++            ml_get_cpu_number(0x600) == 4 && ml_get_cpu_number(0x700) == 5) {
++            last_secondary = 5;
+         }
+     }
+     bool selected = logical >= 0 &&
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -965,13 +965,13 @@
+ 		}
+ #endif
+ #endif /* CONFIG_SPTM */
+-		if (cpu >= 1 && cpu <= 4) {
++		if (cpu >= 1 && cpu <= 5) {
+ 			kprintf("ARMCPU-P2R reset-request cpu=%d affinity=%x handler=%llx\n",
+ 			    cpu, cpu_data_ptr->cpu_phys_id,
+ 			    (unsigned long long)cpu_data_ptr->cpu_reset_handler);
+ 		}
+ 		kern_return_t start_result = PE_cpu_start(cpu_data_ptr->cpu_id, (vm_offset_t)NULL, (vm_offset_t)NULL);
+-		if (cpu >= 1 && cpu <= 4) {
++		if (cpu >= 1 && cpu <= 5) {
+ 			extern volatile uint32_t armcpu_smp_step[8];
+ 			extern volatile int32_t armcpu_smp_psci_rc[8];
+ 			kprintf("ARMCPU-P2R reset-return cpu=%d platform=%d step=%u psci_raw=%d\n",
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -737,7 +737,7 @@
+ 	 * drivers use mach_absolute_time() to implement rate control
+ 	 */
+ 	cpu_timebase_init(FALSE);
+-	if (cpu_data_ptr->cpu_number >= 1 && cpu_data_ptr->cpu_number <= 4) {
++	if (cpu_data_ptr->cpu_number >= 1 && cpu_data_ptr->cpu_number <= 5) {
+ 		uint64_t mpidr;
+ 		__asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
+ 		kprintf("ARMCPU-P2R entry cpu=%u mpidr=%llx\n",

@@ -1,0 +1,119 @@
+--- a/bsd/dev/Sm8250AlertSlider.c
++++ b/bsd/dev/Sm8250AlertSlider.c
+@@ -11,6 +11,7 @@
+ #include <sys/systm.h>
+ #include <vm/memory_types.h>
+ #include "GeniI2c.h"
++#include "In2020SliderPosition.h"
+ #define KEBAB_RPMH_KERNEL 1
+ #include "KebabRpmhVrm.h"
+ #include "kebab_spmi_bus.h"
+@@ -272,7 +273,8 @@
+     GeniI2c bus;
+     uint64_t start_us, deadline_us, last_print_us;
+     unsigned samples, side, timeouts;
+-    bool active;
++    bool active, classify;
++    struct in2020_slider_position position;
+ };
+ static struct slider_stream stream;
+ 
+@@ -420,6 +422,19 @@
+     if (stream.side == 0) {stream.side=1; return;}
+     stream.side=0;
+     ++stream.samples;
++    if (stream.classify) {
++        const unsigned ds=stream.raw[0]&0xff, us=stream.raw[1]&0xff;
++        const int down=(int16_t)((stream.raw[0]>>8)&0xffff), up=(int16_t)((stream.raw[1]>>8)&0xffff);
++        const unsigned previous=stream.position.committed;
++        const unsigned pos=in2020_slider_update(&stream.position,
++            (now-stream.start_us)/1000, down, up, ds, us);
++        if (pos) {
++            static const char *const names[]={"unknown", "up", "middle", "down"};
++            printf("SLIDER position=%s from=%s initial=%u ms=%llu pairs=%u diff=%d sum=%d ringer=unbound\n",
++                names[pos], names[previous], previous==0, (now-stream.start_us)/1000,
++                stream.samples, up-down, up+down);
++        }
++    }
+     if (stream.samples <= 8 || now-stream.last_print_us >= 1000000) {
+         const unsigned down_status=stream.raw[0]&0xff, up_status=stream.raw[1]&0xff;
+         const int down=(int16_t)((stream.raw[0]>>8)&0xffff), up=(int16_t)((stream.raw[1]>>8)&0xffff);
+@@ -435,8 +450,8 @@
+ sm8250_alert_slider_probe(void)
+ {
+     unsigned enabled = 0;
+-    if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || (enabled != 1 && enabled != 2)) return;
+-    printf("SLIDER probe begin mode=%s\n", enabled == 2 ? "ist-samples" : "range-id");
++    if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || (enabled != 1 && enabled != 2 && enabled != 3)) return;
++    printf("SLIDER probe begin mode=%s\n", enabled == 3 ? "ist-position" : (enabled == 2 ? "ist-samples" : "range-id"));
+     vm_offset_t branches = ml_io_map_unmappable(GccBranch, Window, VM_WIMG_IO);
+     vm_offset_t votes = ml_io_map_unmappable(GccVotes, Window, VM_WIMG_IO);
+     vm_offset_t pins = ml_io_map_unmappable(Pins4, Window, VM_WIMG_IO);
+@@ -533,7 +548,8 @@
+     }
+     bool ist=false;
+     idle = slider_identify(se, &ist);
+-    if (ist && enabled == 2 && slider_stream_prepare(se)) {
++    if (ist && enabled >= 2 && slider_stream_prepare(se)) {
++        stream.classify = enabled == 3;
+         /* Transfer all GENI ownership to the same thread's nonblocking key-loop
+          * poll. No SPMI observation or new thread is used during sampling.
+          */
+--- /dev/null
++++ b/bsd/dev/In2020SliderPosition.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#ifndef IN2020_SLIDER_POSITION_H
++#define IN2020_SLIDER_POSITION_H
++/* This handset only: labelled 20261112-185615 capture, user confirmed top boot,
++ * middle/bottom/middle/top. Difference centers -232/-9/223; sum -483/-459/-487.
++ * Factory oplus_tri_key.c initialCalibValue uses 40% of adjacent difference
++ * spacing for internal bounds; judge_interference uses sum tolerance 40.
++ * Use bounded symmetric windows rather than the vendor's broad outer tails.
++ * No proprietary ringer usage or Linux input event is inferred here.
++ */
++struct in2020_slider_position {
++    unsigned candidate, count, committed;
++    unsigned long long since_ms, last_ms;
++};
++
++static inline int in2020_slider_abs(int value) { return value < 0 ? -value : value; }
++
++static inline unsigned
++in2020_slider_candidate(int down, int up, unsigned down_status, unsigned up_status)
++{
++    static const int diff_centers[] = {-232, -9, 223};
++    static const int sum_centers[] = {-483, -459, -487};
++    /* floor(223*0.4), floor(min(223,232)*0.4), floor(232*0.4). */
++    static const int half_width[] = {89, 89, 92};
++    if (!(down_status & 5) || !(up_status & 5)) return 0;
++    const int diff = up-down, sum = up+down;
++    for (unsigned i=0; i<3; ++i) {
++        if (in2020_slider_abs(diff-diff_centers[i]) <= half_width[i] &&
++            in2020_slider_abs(sum-sum_centers[i]) <= 40) return i+1;
++    }
++    return 0;
++}
++
++/* Return only a new confirmed state: 1 top, 2 middle, 3 bottom; zero=no event.
++ * Debounce is board policy (3 valid pairs across >=200ms, gaps <=500ms), not
++ * a claimed factory constant. Raw sensor pairs arrive about every 135ms.
++ */
++static inline unsigned
++in2020_slider_update(struct in2020_slider_position *s, unsigned long long ms,
++    int down, int up, unsigned down_status, unsigned up_status)
++{
++    const unsigned candidate = in2020_slider_candidate(down, up, down_status, up_status);
++    if (!candidate || candidate != s->candidate || ms < s->last_ms || ms-s->last_ms > 500) {
++        s->candidate = candidate;
++        s->count = candidate ? 1 : 0;
++        s->since_ms = ms;
++    } else if (s->count < 3) {
++        ++s->count;
++    }
++    s->last_ms = ms;
++    if (!candidate || s->count < 3 || ms-s->since_ms < 200 || candidate == s->committed) return 0;
++    s->committed = candidate;
++    return candidate;
++}
++#endif

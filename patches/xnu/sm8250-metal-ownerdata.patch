@@ -1,0 +1,29 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1712,7 +1712,7 @@
+ extern int sm8250_alioth_metal_register(void);
+ 
+ /* The original CA reads a Boolean in backboardd's application domain.
+- * This verified factory RAM Data seed has no existing backboardd preferences. */
++ * O_EXCL preserves existing preferences on persistent Data. */
+ static void
+ sm8250_backboard_sdr_preference(uint64_t scratch, vfs_context_t ctx)
+ {
+@@ -1924,7 +1924,7 @@
+     vnode_put(data);
+ }
+ 
+-/* The verified factory RAM Data volume supplies a read-only union upper. */
++/* Verified mounted Data supplies a hash-pinned, read-only union upper. */
+ static void
+ sm8250_wallpaper_prepare(uint64_t scratch)
+ {
+@@ -1945,7 +1945,7 @@
+     uint64_t bytes = 0;
+     unsigned stage = 1;
+     int error = EAUTH;
+-    if (!smufs_aks_fresh_data_ready() || !scratch || scratch > UINT64_MAX - 4096 ||
++    if (!smufs_aks_data_ready() || !scratch || scratch > UINT64_MAX - 4096 ||
+         proc_getpid(current_proc()) != 1 || !native_ram_block_gpu_addon(&addon, &bytes) ||
+         bytes != addon_bytes) goto done;
+     static const uint8_t metal_addon_hash[32] = {0x2f,0xd4,0xc1,0xdd,0x89,0xb6,0xc1,0x6d,0x2a,0xea,0xda,0x2f,0x83,0x43,0x5d,0xa4,0x86,0x33,0x6c,0x27,0xd0,0xf9,0xed,0xa4,0x3e,0xc4,0x74,0xff,0x1f,0xef,0x94,0x6f};

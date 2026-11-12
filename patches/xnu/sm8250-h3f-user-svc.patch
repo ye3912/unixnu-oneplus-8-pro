@@ -1,0 +1,152 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -628,11 +628,13 @@
+ #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST
+ 	trust_enabled = 1;
+ #endif
+-	panic("SMUFS root-h3d phase=%s autherr=%d owner_auth=%d require=%d seen%d devfs-errno%d\n"
++	panic("SMUFS root-h3f phase=%s autherr=%d owner_auth=%d require=%d seen%d devfs-errno%d\n"
++	      "user seen%u gate%u trap%d cpsr%x esr%x\n"
++	      "user pc%llx sp%llx lr%llx\n"
+ 	      "root %s selected%x mounted%x mount-valid%d vnode%d ro%d flags%llx fs=%s\n"
+ 	      "smufs en%u policy%u sig%u imm%u bound%u uniq%u uuid%u typed%u chain%u ro%u\n"
+ 	      "units%llu checked%llu bad%llu media%llx self%u/15 trust%u\n"
+-	      "init en%u attempts%u stage%u path=%.96s\n"
++	      "init en%u mode%u attempts%u stage%u path=%.96s\n"
+ 	      "exec %u/%u errno%d alloc%d scratch%u\n"
+ 	      "lookup%u/%u errno%d perm%u errno%d read%u/%u errno%d magic%x\n"
+ 	      "activate%u/%u errno%d signature%u/%u errno%d\n"
+@@ -642,6 +644,8 @@
+ 	      "vfsroot%u/%u errno%d published%u valid%u dev%x\n"
+ 	      "auth%u/%u errno%d devfs%u/%u errno%d\n",
+ 	      boundary, autherr, owner_authorized, require_rootauth, smufs_saved_seen, devfs_error,
++	      native_smufs_init_trace.user_seen, __atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE), native_smufs_init_trace.user_trap, native_smufs_init_trace.user_cpsr, native_smufs_init_trace.user_esr,
++	      (unsigned long long)native_smufs_init_trace.user_pc, (unsigned long long)native_smufs_init_trace.user_sp, (unsigned long long)native_smufs_init_trace.user_lr,
+ 	      rootdevice, (uint32_t)rootdev, (uint32_t)mounted_dev, mounted != NULL, rootvnode != NULLVP,
+ 	      (mount_flags & MNT_RDONLY) != 0, (unsigned long long)mount_flags, fsname,
+ 	      smufs_owner.enabled, smufs_owner.policy, smufs_owner.signature_status, smufs_owner.immutable,
+@@ -649,7 +653,7 @@
+ 	      (unsigned long long)smufs_owner.units, (unsigned long long)smufs_owner.verified,
+ 	      (unsigned long long)smufs_owner.failures, (unsigned long long)smufs_owner.media_id,
+ 	      smufs_owner.selftests, smufs_owner.trust_requested,
+-	      native_smufs_init_trace.enabled, native_smufs_init_trace.attempts, native_smufs_init_trace.stage, native_smufs_init_trace.path,
++	      native_smufs_init_trace.enabled, native_smufs_init_trace.selector, native_smufs_init_trace.attempts, native_smufs_init_trace.stage, native_smufs_init_trace.path,
+ 	      native_smufs_init_trace.exec_enter, native_smufs_init_trace.exec_return, native_smufs_init_trace.exec_error, native_smufs_init_trace.alloc_error, native_smufs_init_trace.scratch,
+ 	      native_smufs_init_trace.lookup_enter, native_smufs_init_trace.lookup_return, native_smufs_init_trace.lookup_error,
+ 	      native_smufs_init_trace.permission_return, native_smufs_init_trace.permission_error,
+@@ -673,6 +677,29 @@
+ {
+  native_smufs_init_trace.exec_error=error;
+  native_smufs_auth_diag(phase,smufs_saved_autherr,smufs_saved_owner,smufs_saved_require,smufs_saved_devfs);
++}
++
++/* H3F one-shot witness: release after exec snapshot, acquire in EL0 SVC path. */
++uint32_t native_smufs_init_user_gate;
++__attribute__((noinline)) void
++native_smufs_init_user_arm(void)
++{
++ const struct SmUfsInitTrace *v=&native_smufs_init_trace;
++ if (!v->enabled || v->selector!=2 || v->stage!=12 || v->exec_enter!=1 || v->exec_return!=1 || v->exec_error || v->signature_enter!=1 || v->signature_return!=1 || v->signature_error) return;
++ uint32_t expected=0;
++ (void)__atomic_compare_exchange_n(&native_smufs_init_user_gate,&expected,1,0,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
++}
++__attribute__((noinline)) void
++native_smufs_init_user_svc(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr)
++{
++ if (__atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE)!=1) return;
++ if (proc_getpid(current_proc())!=1 || (cpsr&0x1f)!=0 || ((esr>>26)&0x3f)!=0x15 || !pc || !sp) return;
++ uint32_t expected=1;
++ if (!__atomic_compare_exchange_n(&native_smufs_init_user_gate,&expected,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return;
++ native_smufs_init_trace.user_pc=pc; native_smufs_init_trace.user_sp=sp; native_smufs_init_trace.user_lr=lr;
++ native_smufs_init_trace.user_trap=trap; native_smufs_init_trace.user_cpsr=cpsr; native_smufs_init_trace.user_esr=esr;
++ native_smufs_init_trace.user_seen=1; native_smufs_init_trace.stage=13;
++ native_smufs_init_diag("user-svc",0);
+ }
+ 
+ void
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8155,8 +8155,9 @@
+  if (smufs_init_tracing()) {
+   uint32_t attempts=native_smufs_init_trace.attempts+1;
+   int32_t allocated=native_smufs_init_trace.alloc_error;
++  uint32_t selector=native_smufs_init_trace.selector;
+   memset(&native_smufs_init_trace,0,sizeof(native_smufs_init_trace));
+-  native_smufs_init_trace.enabled=1; native_smufs_init_trace.attempts=attempts;
++  native_smufs_init_trace.enabled=1; native_smufs_init_trace.selector=selector; native_smufs_init_trace.attempts=attempts;
+   native_smufs_init_trace.alloc_error=allocated; native_smufs_init_trace.scratch=scratch_addr!=0;
+   native_smufs_init_trace.stage=1; strlcpy(native_smufs_init_trace.path,path,sizeof(native_smufs_init_trace.path));
+  }
+@@ -8165,7 +8166,8 @@
+   native_smufs_init_trace.exec_return=native_smufs_init_trace.exec_enter;
+   native_smufs_init_trace.exec_error=error;
+   if (native_smufs_init_trace.exec_enter) native_smufs_init_trace.stage=12;
+-  if (error!=ENOENT) native_smufs_init_diag(native_smufs_init_trace.exec_enter?"init-exec-return":"init-prep-failed",error);
++  if (!error && native_smufs_init_trace.selector==2) native_smufs_init_user_arm();
++  else if (error!=ENOENT) native_smufs_init_diag(native_smufs_init_trace.exec_enter?"init-exec-return":"init-prep-failed",error);
+  }
+  return error;
+ }
+@@ -8219,8 +8221,9 @@
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
+ 
+ 	uint32_t smufs_init_selector=0;
+-	if (PE_parse_boot_argn("native-ufs-init-diag",&smufs_init_selector,sizeof(smufs_init_selector)) && smufs_init_selector==1 && proc_getpid(p)==1)
+-		native_smufs_init_trace.enabled=1;
++	if (PE_parse_boot_argn("native-ufs-init-diag",&smufs_init_selector,sizeof(smufs_init_selector)) && (smufs_init_selector==1 || smufs_init_selector==2) && proc_getpid(p)==1) {
++		native_smufs_init_trace.enabled=1; native_smufs_init_trace.selector=smufs_init_selector;
++	}
+ 	kern_return_t smufs_allocation=mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
+ 	if (smufs_init_tracing()) {
+ 		native_smufs_init_trace.alloc_error=smufs_allocation; native_smufs_init_trace.scratch=scratch_addr!=0;
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -4,6 +4,9 @@
+ #include <stdint.h>
+ struct SmUfsInitTrace {
+  uint32_t enabled,attempts,stage,scratch,exec_enter,exec_return;
++ uint32_t selector,user_seen,user_cpsr,user_esr;
++ int32_t user_trap;
++ uint64_t user_pc,user_sp,user_lr;
+  int32_t alloc_error,exec_error;
+  uint32_t lookup_enter,lookup_return; int32_t lookup_error;
+  uint32_t permission_return; int32_t permission_error;
+@@ -13,5 +16,8 @@
+  char path[128];
+ };
+ extern struct SmUfsInitTrace native_smufs_init_trace;
++extern uint32_t native_smufs_init_user_gate;
++void native_smufs_init_user_arm(void);
++void native_smufs_init_user_svc(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr);
+ __attribute__((noreturn)) void native_smufs_init_diag(const char *phase,int error);
+ #endif
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -62,6 +62,7 @@
+ #include <vm/vm_kern.h>
+ 
+ #include <sys/errno.h>
++#include <sys/smufs_init_trace.h>
+ #include <sys/kdebug.h>
+ #include <sys/code_signing.h>
+ #include <kperf/kperf.h>
+@@ -763,6 +764,8 @@
+ 			panic("Invalid SVC_64 context");
+ 		}
+ 
++		if (ml_get_interrupts_enabled() && __atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE)==1)
++			native_smufs_init_user_svc(get_saved_state_pc(state),get_saved_state_sp(state),get_saved_state_lr(state),get_saved_state_svc_number(state),get_saved_state_cpsr(state),esr);
+ 		handle_svc(state);
+ 		break;
+ 
+--- a/bsd/sys/Makefile
++++ b/bsd/sys/Makefile
+@@ -266,6 +266,8 @@
+ 
+ INSTALL_MI_DIR = sys
+ 
++XNU_ONLY_EXPORTS += smufs_init_trace.h
++
+ EXPORT_MI_LIST	= $(sort ${KERNELFILES} ${PRIVATE_KERNELFILES} ${XNU_ONLY_EXPORTS})
+ 
+ EXPORT_MI_GEN_LIST = syscall.h sysproto.h

@@ -1,0 +1,59 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1831,8 +1831,8 @@
+  static const struct {const char *name; uint64_t uuid_va, annotation_va; unsigned char uuid[16];} images[]={{"Foundation",0x186e21570ULL,0x1ed70b440ULL,{0x96,0x73,0x3d,0x34,0x0a,0x37,0x3c,0x34,0x81,0x0a,0x73,0x5d,0x17,0x20,0xae,0x42}},
+ {"CoreFoundation",0x187e72208ULL,0x1ed77b650ULL,{0xa4,0x22,0xc5,0x78,0x54,0xc4,0x30,0xc6,0x86,0xd8,0x5e,0xa8,0x1d,0x96,0x94,0xbe}},
+ {"libc++abi.dylib",0x1dd5307e0ULL,0x1efb39768ULL,{0xf1,0xb0,0xb7,0x0e,0xf8,0xd3,0x39,0xd9,0xa4,0xd6,0x03,0x68,0x5a,0xfe,0xe1,0xb6}}};
+- static unsigned counts[6];
+- const char *targets[]={"SpringBoard","backboardd","powerd","chronod","liveactivitiesd","pkd"};
++ static unsigned counts[7];
++ const char *targets[]={"SpringBoard","backboardd","powerd","chronod","liveactivitiesd","pkd","Preferences"};
+  _Static_assert(sizeof(counts) / sizeof(counts[0]) == sizeof(targets) / sizeof(targets[0]), "GUI target count");
+  unsigned enabled=0,index;
+  if(p!=current_proc())return;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2225,6 +2225,7 @@
+  unsigned chrono_event=0;
+  unsigned peer_event=0;
+  unsigned peer_kind=0;
++	unsigned preferences_event = 0;
+ #endif
+ 	proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+ 
+@@ -2284,6 +2285,25 @@
+   }
+  }
+ #endif
++#if DEVELOPMENT || DEBUG
++	/* Reuse the kernel's copy of the exec path for spawn and execve. */
++	static const char preferences_suffix[] = "/Preferences.app/Preferences";
++	size_t path_length = strlen(excpath);
++	const size_t suffix_length = sizeof(preferences_suffix) - 1;
++	if (path_length >= suffix_length &&
++	    strcmp(excpath + path_length - suffix_length, preferences_suffix) == 0) {
++		unsigned enabled = 0;
++		if (PE_parse_boot_argn("gui-exit-diag", &enabled, sizeof(enabled)) && enabled == 1) {
++			static unsigned attempts;
++			unsigned count = __atomic_fetch_add(&attempts, 1, __ATOMIC_RELAXED);
++			if (count < 8) {
++				preferences_event = count + 1;
++				printf("PREFDIAG attempt=%u caller=%d target=%d\n", preferences_event,
++				    proc_getpid(current_proc()), proc_getpid(p));
++			}
++		}
++	}
++#endif
+ 	/* Use excpath, which contains the copyin-ed exec path */
+ 	DTRACE_PROC1(exec, uintptr_t, excpath);
+ 
+@@ -2451,6 +2471,9 @@
+  if(peer_event)printf("PKLIFE31 result kind%u event%u target%d errno%d\n",
+   peer_kind,peer_event,proc_getpid(p),error);
+  if(chrono_event)printf("CHRONO27 exec result%u pid%d errno%d\n",chrono_event,proc_getpid(p),error);
++	if (preferences_event) {
++		printf("PREFDIAG result=%u target=%d error=%d\n", preferences_event, proc_getpid(p), error);
++	}
+ #endif
+ 	return error;
+ }

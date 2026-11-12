@@ -1,0 +1,119 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1117,17 +1117,75 @@
+  __atomic_store_n(&smufs_mount_output.lock,0U,__ATOMIC_RELEASE);return note;
+ }
+ 
++/* Four never-reused records from the first original tzinit process only.
++ * Copying user strings is diagnostic; it never changes the original syscall.
++ */
++static struct {
++ uint32_t lock,pid,entered,dropped;
++ struct {uint32_t state,op;int fd,error,source_copy,link_copy;char source[160],link[160];} slot[4];
++} smufs_tz_symlink;
++__attribute__((noinline)) uint32_t
++native_smufs_tz_symlink_begin(uint32_t op,int fd,uint64_t source,uint64_t link)
++{
++ proc_t p=current_proc();
++ if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE)||!p||
++    strncmp(p->p_name,"tzinit",sizeof(p->p_name)))return 0;
++ if(__atomic_exchange_n(&smufs_tz_symlink.lock,1U,__ATOMIC_ACQUIRE)){
++  __atomic_add_fetch(&smufs_tz_symlink.dropped,1U,__ATOMIC_RELAXED);return 0;}
++ uint32_t token=0,pid=(uint32_t)proc_getpid(p);
++ if(!__atomic_load_n(&smufs_tz_symlink.pid,__ATOMIC_RELAXED))__atomic_store_n(&smufs_tz_symlink.pid,pid,__ATOMIC_RELEASE);
++ if(__atomic_load_n(&smufs_tz_symlink.pid,__ATOMIC_RELAXED)!=pid)goto out;
++ uint32_t index;index=__atomic_load_n(&smufs_tz_symlink.entered,__ATOMIC_RELAXED);
++ if(index>=4){__atomic_add_fetch(&smufs_tz_symlink.dropped,1U,__ATOMIC_RELAXED);goto out;}
++ size_t copied;copied=0;
++ smufs_tz_symlink.slot[index].op=op;smufs_tz_symlink.slot[index].fd=fd;
++ smufs_tz_symlink.slot[index].source_copy=copyinstr(source,smufs_tz_symlink.slot[index].source,sizeof(smufs_tz_symlink.slot[index].source),&copied);
++ smufs_tz_symlink.slot[index].link_copy=copyinstr(link,smufs_tz_symlink.slot[index].link,sizeof(smufs_tz_symlink.slot[index].link),&copied);
++ smufs_tz_symlink.slot[index].source[159]=0;smufs_tz_symlink.slot[index].link[159]=0;
++ __atomic_store_n(&smufs_tz_symlink.entered,index+1,__ATOMIC_RELEASE);
++ __atomic_store_n(&smufs_tz_symlink.slot[index].state,1U,__ATOMIC_RELEASE);token=index+1;
++out:
++ __atomic_store_n(&smufs_tz_symlink.lock,0U,__ATOMIC_RELEASE);return token;
++}
++__attribute__((noinline)) void
++native_smufs_tz_symlink_end(uint32_t token,int error)
++{
++ if(!token||token>4||!current_proc()||(uint32_t)proc_getpid(current_proc())!=__atomic_load_n(&smufs_tz_symlink.pid,__ATOMIC_ACQUIRE))return;
++ uint32_t expected=1;
++ if(!__atomic_compare_exchange_n(&smufs_tz_symlink.slot[token-1].state,&expected,3U,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
++ smufs_tz_symlink.slot[token-1].error=error;
++ __atomic_store_n(&smufs_tz_symlink.slot[token-1].state,2U,__ATOMIC_RELEASE);
++}
++__attribute__((noinline)) static const char *
++smufs_tz_symlink_note(void)
++{
++ static char note[528];int selected=-1;uint32_t returned=0;
++ uint32_t entered=__atomic_load_n(&smufs_tz_symlink.entered,__ATOMIC_ACQUIRE);
++ for(uint32_t i=0;i<entered&&i<4;++i){
++  if(__atomic_load_n(&smufs_tz_symlink.slot[i].state,__ATOMIC_ACQUIRE)!=2)continue;
++  ++returned;
++  if(selected<0||!smufs_tz_symlink.slot[selected].error)selected=(int)i;
++ }
++ if(selected<0){snprintf(note,sizeof(note),"tz-symlink pid%u current%u enter%u return%u drop%u unobserved\n",
++     __atomic_load_n(&smufs_tz_symlink.pid,__ATOMIC_ACQUIRE),(uint32_t)proc_getpid(current_proc()),entered,returned,__atomic_load_n(&smufs_tz_symlink.dropped,__ATOMIC_RELAXED));return note;}
++ snprintf(note,sizeof(note),"tz-symlink pid%u current%u enter%u return%u drop%u record%d\nop%u fd%d errno%d copy%d/%d\nsource %.159s\nlink %.159s\n",
++     __atomic_load_n(&smufs_tz_symlink.pid,__ATOMIC_ACQUIRE),(uint32_t)proc_getpid(current_proc()),entered,returned,__atomic_load_n(&smufs_tz_symlink.dropped,__ATOMIC_RELAXED),selected+1,
++     smufs_tz_symlink.slot[selected].op,smufs_tz_symlink.slot[selected].fd,smufs_tz_symlink.slot[selected].error,
++     smufs_tz_symlink.slot[selected].source_copy,smufs_tz_symlink.slot[selected].link_copy,
++     smufs_tz_symlink.slot[selected].source,smufs_tz_symlink.slot[selected].link);return note;
++}
++
+ __attribute__((noinline)) const char *
+ native_smufs_cache_panic_note(void)
+ {
+- static char note[1760];
++ static char note[2304];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3r prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3s prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note());
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
+  return note;
+ }
+ 
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -37,6 +37,8 @@
+ void native_smufs_cache_console(int fd,uint64_t address,uint64_t bytes);
+ void native_smufs_mount_console(int fd,uint64_t address,uint64_t bytes);
+ void native_smufs_mount_writev(int fd,uint64_t address,int32_t count);
++uint32_t native_smufs_tz_symlink_begin(uint32_t op,int fd,uint64_t source,uint64_t link);
++void native_smufs_tz_symlink_end(uint32_t token,int error);
+ struct vnode;
+ int native_smufs_cache_carrier(struct vnode *process_root,struct vnode *file);
+ void native_smufs_cache_map_event(uint32_t returning,int error);
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -6050,16 +6050,22 @@
+ int
+ symlink(__unused proc_t p, struct symlink_args *uap, __unused int32_t *retval)
+ {
+-	return symlinkat_internal(vfs_context_current(), uap->path, AT_FDCWD,
++	uint32_t ticket=native_smufs_tz_symlink_begin(1,AT_FDCWD,uap->path,uap->link);
++	int error=symlinkat_internal(vfs_context_current(), uap->path, AT_FDCWD,
+ 	           uap->link, UIO_USERSPACE);
++	native_smufs_tz_symlink_end(ticket,error);
++	return error;
+ }
+ 
+ int
+ symlinkat(__unused proc_t p, struct symlinkat_args *uap,
+     __unused int32_t *retval)
+ {
+-	return symlinkat_internal(vfs_context_current(), uap->path1, uap->fd,
++	uint32_t ticket=native_smufs_tz_symlink_begin(2,uap->fd,uap->path1,uap->path2);
++	int error=symlinkat_internal(vfs_context_current(), uap->path1, uap->fd,
+ 	           uap->path2, UIO_USERSPACE);
++	native_smufs_tz_symlink_end(ticket,error);
++	return error;
+ }
+ 
+ /*

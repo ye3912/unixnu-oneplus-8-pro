@@ -1,0 +1,115 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1175,19 +1175,88 @@
+      smufs_tz_symlink.slot[selected].source,smufs_tz_symlink.slot[selected].link);return note;
+ }
+ 
++/* One original EL0 BRK snapshot from watchdogd after verified cache/Data prep.
++ * Nonwaiting one-shot publication. Bounded user copies can fault/page in;
++ * no user register, instruction, exception, return or critical policy is changed.
++ */
++static struct {
++ uint32_t state,dropped,pid,cpsr,esr;int code_error,x0_error,adr_error;
++ uint64_t pc,sp,lr,x0,adr;uint32_t code[16];
++ char x0_message[160],adr_message[160];
++} smufs_watchdog_brk;
++__attribute__((noinline)) void
++native_smufs_watchdog_brk(uint64_t pc,uint64_t sp,uint64_t lr,uint64_t x0,uint32_t cpsr,uint32_t esr)
++{
++ proc_t p=current_proc();
++ if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE)||!p||
++    strncmp(p->p_name,"watchdogd",sizeof(p->p_name))||(cpsr&31)||
++    ((esr>>26)&63)!=0x3c||!pc||!sp)return;
++ uint32_t expected=0;
++ if(!__atomic_compare_exchange_n(&smufs_watchdog_brk.state,&expected,1U,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
++  __atomic_add_fetch(&smufs_watchdog_brk.dropped,1U,__ATOMIC_RELAXED);return;}
++ smufs_watchdog_brk.pid=(uint32_t)proc_getpid(p);smufs_watchdog_brk.pc=pc;
++ smufs_watchdog_brk.sp=sp;smufs_watchdog_brk.lr=lr;smufs_watchdog_brk.x0=x0;
++ smufs_watchdog_brk.cpsr=cpsr;smufs_watchdog_brk.esr=esr;
++ smufs_watchdog_brk.code_error=EFAULT;smufs_watchdog_brk.adr_error=ENOENT;
++ size_t copied=0;
++ smufs_watchdog_brk.x0_error=copyinstr(x0,smufs_watchdog_brk.x0_message,sizeof(smufs_watchdog_brk.x0_message),&copied);
++ smufs_watchdog_brk.x0_message[159]=0;
++ if(pc>=32&&pc<=~(uint64_t)0-31){
++  smufs_watchdog_brk.code_error=copyin(pc-32,smufs_watchdog_brk.code,sizeof(smufs_watchdog_brk.code));
++  /* Decode only an actually observed ADR x0; NOP; BL; BRK sequence.
++   * Report its live literal, never substitute a compiled expected message.
++   */
++  const uint32_t *c=smufs_watchdog_brk.code;
++  if(!smufs_watchdog_brk.code_error&&(c[5]&0x9f00001f)==0x10000000&&
++     c[6]==0xd503201f&&(c[7]&0xfc000000)==0x94000000&&
++     (c[8]&0xffe0001f)==0xd4200000){
++   int64_t delta=(int64_t)((((c[5]>>5)&0x7ffff)<<2)|((c[5]>>29)&3));
++   if(delta&(1<<20))delta-=(1<<21);
++   uint64_t base=pc-12;
++   if((delta>=0&&base<=~(uint64_t)0-(uint64_t)delta)||(delta<0&&base>=(uint64_t)-delta)){
++    smufs_watchdog_brk.adr=base+(uint64_t)delta;
++    smufs_watchdog_brk.adr_error=copyinstr(smufs_watchdog_brk.adr,smufs_watchdog_brk.adr_message,sizeof(smufs_watchdog_brk.adr_message),&copied);
++    smufs_watchdog_brk.adr_message[159]=0;
++   }
++  }
++ }
++ __atomic_store_n(&smufs_watchdog_brk.state,2U,__ATOMIC_RELEASE);
++}
++__attribute__((noinline)) static const char *
++smufs_watchdog_brk_note(void)
++{
++ static char note[880];
++ uint32_t state=__atomic_load_n(&smufs_watchdog_brk.state,__ATOMIC_ACQUIRE);
++ if(state!=2){snprintf(note,sizeof(note),"watchdog-brk state%u drop%u unobserved\n",state,__atomic_load_n(&smufs_watchdog_brk.dropped,__ATOMIC_RELAXED));return note;}
++ const uint32_t *c=smufs_watchdog_brk.code;
++ snprintf(note,sizeof(note),"watchdog-brk state2 pid%u current%u cpsr%x esr%x drop%u\n"
++     "pc%llx sp%llx lr%llx x0%llx\ncode errno%d\n"
++     "%08x %08x %08x %08x %08x %08x %08x %08x\n"
++     "%08x %08x %08x %08x %08x %08x %08x %08x\n"
++     "adr%llx errno%d %.159s\nx0-message errno%d %.159s\n",
++     smufs_watchdog_brk.pid,(uint32_t)proc_getpid(current_proc()),smufs_watchdog_brk.cpsr,smufs_watchdog_brk.esr,
++     __atomic_load_n(&smufs_watchdog_brk.dropped,__ATOMIC_RELAXED),
++     (unsigned long long)smufs_watchdog_brk.pc,(unsigned long long)smufs_watchdog_brk.sp,
++     (unsigned long long)smufs_watchdog_brk.lr,(unsigned long long)smufs_watchdog_brk.x0,
++     smufs_watchdog_brk.code_error,c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15],
++     (unsigned long long)smufs_watchdog_brk.adr,smufs_watchdog_brk.adr_error,smufs_watchdog_brk.adr_message,
++     smufs_watchdog_brk.x0_error,smufs_watchdog_brk.x0_message);
++ return note;
++}
++
+ static const char *smufs_data_note(void);
+ 
+ __attribute__((noinline)) const char *
+ native_smufs_cache_panic_note(void)
+ {
+- static char note[2688];
++ static char note[3584];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3t prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3u prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),smufs_data_note(),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),smufs_watchdog_brk_note(),smufs_data_note(),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
+  return note;
+ }
+ 
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -42,6 +42,7 @@
+ struct vnode;
+ int native_smufs_cache_carrier(struct vnode *process_root,struct vnode *file);
+ void native_smufs_cache_map_event(uint32_t returning,int error);
++void native_smufs_watchdog_brk(uint64_t pc,uint64_t sp,uint64_t lr,uint64_t x0,uint32_t cpsr,uint32_t esr);
+ const char *native_smufs_cache_panic_note(void);
+ uint64_t native_smufs_cache_prepare(uint64_t scratch);
+ __attribute__((noreturn)) void native_smufs_cache_probe(uint64_t scratch);
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -855,6 +855,8 @@
+ 			handle_kernel_breakpoint(state, esr);
+ 			break;
+ 		} else {
++			if (ml_get_interrupts_enabled())
++				native_smufs_watchdog_brk(get_saved_state_pc(state),get_saved_state_sp(state),get_saved_state_lr(state),get_saved_state_reg(state,0),get_saved_state_cpsr(state),esr);
+ 			handle_breakpoint(state, esr);
+ 			__builtin_unreachable();
+ 		}

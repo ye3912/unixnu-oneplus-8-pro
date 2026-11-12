@@ -1,0 +1,275 @@
+--- a/bsd/dev/Sm8250AlertSlider.c
++++ b/bsd/dev/Sm8250AlertSlider.c
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: BSD-2-Clause-Patent */
+ /* IN2020 factory DTS i2c@984000; gcc-kona.c wrap0 S1; pinctrl-kona.c GPIO4/5.
+- * Discovery only: no sensor configuration writes. L10 is qualified and
++ * IST8801 measurement capture using the factory reset/20Hz profile. L10 is qualified and
+  * brought up with a 3008 mV vote; accept only the factory 3000..3312 mV
+  * interval, inside both candidate sensors' documented operating ranges.
+  * Called before the physical-key worker acquires the shared SPMI observer.
+@@ -18,6 +18,8 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ void sm8250_alert_slider_probe(void);
++void sm8250_alert_slider_poll(void);
++void sm8250_alert_slider_stop(void);
+ 
+ enum {
+     Window = 0x4000, SpmiCoreSpan = 0x2000,
+@@ -212,7 +214,7 @@
+ }
+ 
+ static bool
+-slider_identify(void *se)
++slider_identify(void *se, bool *identified_ist)
+ {
+     static const uint32_t registers[] = {
+         GENI_DMA_MODE, GENI_TX_PACK0, GENI_TX_PACK1, GENI_RX_PACK0, GENI_RX_PACK1,
+@@ -253,15 +255,188 @@
+         }
+     }
+     printf("SLIDER controller idle=%u restored=%u\n", idle, restored);
++    *identified_ist = ist && !mxm && idle && restored;
+     return idle;
++}
++
++static const uint32_t stream_io_regs[] = {
++    GENI_DMA_MODE, GENI_TX_PACK0, GENI_TX_PACK1, GENI_RX_PACK0, GENI_RX_PACK1,
++    GENI_BYTE_GRAN, GENI_TX_LEN, GENI_RX_LEN, GENI_M_IRQ_EN,
++};
++static const uint32_t stream_setup_regs[] = {0x28, 0x24, 0x20, 0x7c, GENI_CLK_CFG, GENI_SCL_COUNTERS};
++
++struct slider_stream {
++    vm_offset_t branches, votes, pins, engine;
++    uint32_t added_votes, pin4, pin5, route;
++    uint32_t setup_saved[6], io_saved[9], raw[2];
++    GeniI2c bus;
++    uint64_t start_us, deadline_us, last_print_us;
++    unsigned samples, side, timeouts;
++    bool active;
++};
++static struct slider_stream stream;
++
++static bool
++ist_read(GeniI2c *bus, uint8_t reg, uint8_t *value)
++{
++    if (geni_i2c_start_read(bus, reg) || slider_wait(bus) != GeniDone) return false;
++    *value = bus->data;
++    return true;
++}
++
++static bool
++ist_write(GeniI2c *bus, uint8_t reg, uint8_t value)
++{
++    if (geni_i2c_start_write(bus, reg, value) || slider_wait(bus) != GeniDone) {
++        printf("SLIDER ist-write failed addr=%02x reg=%02x error=%u irq=%x\n",
++            bus->address, reg, bus->error, bus->error_status);
++        return false;
++    }
++    return true;
++}
++
++static bool
++ist_measurement_init(GeniI2c *bus)
++{
++    /* Register facts and ordering: vendor hall_ist8801_up/down.c
++     * reset_device() and set_operation_mode(MEASUREMENT). Polling is the
++     * documented INTSRS bit7=0; no threshold IRQ is armed on GPIO157/158.
++     */
++    uint8_t id=0, gain=0, info=0, adc=0, interface=0, opf=0, intsrs=0;
++    if (!ist_write(bus, 0x07, 1)) return false;
++    delay(20000);
++    if (!ist_read(bus, 0x09, &id) || id != 0x81 ||
++        !ist_write(bus, 0x76, 4) || !ist_write(bus, 0x6c, 5) ||
++        !ist_read(bus, 0x54, &gain) || !ist_read(bus, 0x87, &info) ||
++        !ist_read(bus, 0x0d, &adc) || !ist_write(bus, 0x00, 0x20) ||
++        !ist_write(bus, 0x01, 0) || !ist_write(bus, 0x20, 0)) return false;
++    delay(5000);
++    if (!ist_write(bus, 0x08, 0) || !ist_read(bus, 0x40, &interface) ||
++        !ist_write(bus, 0x40, interface | 4) || !ist_write(bus, 0x08, 0x70) ||
++        !ist_read(bus, 0x08, &opf) || !ist_read(bus, 0x01, &intsrs)) return false;
++    const bool ready = opf == 0x70 && (intsrs & 0x87) == 0;
++    printf("SLIDER ist-init addr=%02x id=%02x gain=%02x info=%02x adc=%02x opf=%02x intsrs=%02x ready=%u\n",
++        bus->address, id, gain, info, adc, opf, intsrs, ready);
++    return ready;
++}
++
++static bool
++slider_stream_prepare(void *se)
++{
++    stream = (struct slider_stream){0};
++    for (unsigned i=0; i<9; ++i) stream.io_saved[i] = slider_read(se, stream_io_regs[i]);
++    const GeniIo io = {slider_read, slider_poll_write, se};
++    GeniI2c bus;
++    for (unsigned i=0; i<2; ++i) {
++        uint32_t config=0;
++        if (geni_i2c_prepare(&bus, &io, (uint8_t)(0x18+i), &config) ||
++            !ist_measurement_init(&bus)) {
++            printf("SLIDER measurement-init failed side=%u\n", i);
++            if (slider_idle(se)) {
++                for (unsigned j=0; j<2; ++j) {
++                    if (geni_i2c_prepare(&bus, &io, (uint8_t)(0x18+j), &config) ||
++                        !ist_write(&bus, 0x08, 0) || !slider_idle(se)) break;
++                }
++                if (slider_idle(se))
++                    for (unsigned j=0; j<9; ++j) slider_write(se, stream_io_regs[j], stream.io_saved[j]);
++            }
++            return false;
++        }
++    }
++    uint32_t config=0;
++    if (geni_i2c_prepare(&stream.bus, &io, 0x18, &config)) {
++        if (slider_idle(se))
++            for (unsigned i=0; i<9; ++i) slider_write(se, stream_io_regs[i], stream.io_saved[i]);
++        return false;
++    }
++    stream.start_us = slider_now_us(NULL);
++    stream.active = true;
++    printf("SLIDER sampling armed hz=20 poll=key-worker max_minutes=30; hold each position for 3 seconds\n");
++    return true;
++}
++
++static void
++slider_stream_stop(const char *reason)
++{
++    void *se = (void *)stream.engine;
++    stream.active = false;
++    const bool idle = !(slider_read(se, Status) & Active);
++    printf("SLIDER sampling stopped reason=%s samples=%u idle=%u sensor-restore=deferred\n",
++        reason, stream.samples, idle);
++    /* A dirty controller remains gated with its clock held until reset. */
++    if (!idle) return;
++    slider_write(se, GENI_M_IRQ_CLEAR, slider_read(se, GENI_M_IRQ_STATUS));
++    for (unsigned i=0; i<9; ++i) slider_write(se, stream_io_regs[i], stream.io_saved[i]);
++    for (unsigned i=0; i<6; ++i) slider_write(se, stream_setup_regs[i], stream.setup_saved[i]);
++    slider_write((void *)stream.pins, 0, stream.pin4);
++    slider_write((void *)stream.pins, 0x1000, stream.pin5);
++    slider_write(se, GENI_SE_IRQ_EN, stream.route);
++    slider_write((void *)stream.votes, VoteReg, slider_read((void *)stream.votes, VoteReg) & ~stream.added_votes);
++    ml_io_unmap(stream.engine, Window);
++    ml_io_unmap(stream.pins, Window);
++    ml_io_unmap(stream.votes, Window);
++    ml_io_unmap(stream.branches, Window);
++}
++
++void
++sm8250_alert_slider_stop(void)
++{
++    if (stream.active) slider_stream_stop("key-worker-exit");
++}
++
++void
++sm8250_alert_slider_poll(void)
++{
++    if (!stream.active) return;
++    const uint64_t now = slider_now_us(NULL);
++    if (!geni_i2c_busy(&stream.bus)) {
++        if (slider_read((void *)stream.engine, Status) & Active) {
++            slider_stream_stop("unexpected-active"); return;
++        }
++        if (now-stream.start_us >= 1800000000ULL) {slider_stream_stop("capture-complete"); return;}
++        const uint8_t reg=0x10;
++        stream.bus.address = (uint8_t)(0x18+stream.side);
++        if (geni_i2c_start_read_bytes(&stream.bus, &reg, 1, 3)) {
++            slider_stream_stop("start-failed"); return;
++        }
++        stream.deadline_us = now+200000;
++        stream.timeouts = 0;
++        return;
++    }
++    const int result = geni_i2c_poll(&stream.bus);
++    if (result == GeniPending) {
++        if (now >= stream.deadline_us) {
++            (void)geni_i2c_timeout(&stream.bus);
++            stream.deadline_us = now+64000;
++            if (++stream.timeouts >= 3) slider_stream_stop("timeout");
++        }
++        return;
++    }
++    if (result != GeniDone) {
++        printf("SLIDER sample-failed side=%u error=%u irq=%x\n", stream.side, stream.bus.error, stream.bus.error_status);
++        slider_stream_stop("transfer-failed"); return;
++    }
++    stream.raw[stream.side] = stream.bus.rx;
++    if (stream.side == 0) {stream.side=1; return;}
++    stream.side=0;
++    ++stream.samples;
++    if (stream.samples <= 8 || now-stream.last_print_us >= 1000000) {
++        const unsigned down_status=stream.raw[0]&0xff, up_status=stream.raw[1]&0xff;
++        const int down=(int16_t)((stream.raw[0]>>8)&0xffff), up=(int16_t)((stream.raw[1]>>8)&0xffff);
++        const bool valid=(down_status&5) && (up_status&5);
++        printf("SLIDER sample=%u ms=%llu down=%d up=%d diff=%d sum=%d status=%02x/%02x valid=%u raw=%06x/%06x\n",
++            stream.samples, (now-stream.start_us)/1000, down, up, up-down, up+down,
++            down_status, up_status, valid, stream.raw[0]&0xffffff, stream.raw[1]&0xffffff);
++        stream.last_print_us=now;
++    }
+ }
+ 
+ void
+ sm8250_alert_slider_probe(void)
+ {
+     unsigned enabled = 0;
+-    if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || enabled != 1) return;
+-    printf("SLIDER probe begin mode=range-id\n");
++    if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || (enabled != 1 && enabled != 2)) return;
++    printf("SLIDER probe begin mode=%s\n", enabled == 2 ? "ist-samples" : "range-id");
+     vm_offset_t branches = ml_io_map_unmappable(GccBranch, Window, VM_WIMG_IO);
+     vm_offset_t votes = ml_io_map_unmappable(GccVotes, Window, VM_WIMG_IO);
+     vm_offset_t pins = ml_io_map_unmappable(Pins4, Window, VM_WIMG_IO);
+@@ -356,7 +531,19 @@
+     if (slider_read(se, GENI_CLK_CFG) != 0x71 || slider_read(se, GENI_SCL_COUNTERS) != counters) {
+         printf("SLIDER probe skipped=timing-readback\n"); goto done;
+     }
+-    idle = slider_identify(se);
++    bool ist=false;
++    idle = slider_identify(se, &ist);
++    if (ist && enabled == 2 && slider_stream_prepare(se)) {
++        /* Transfer all GENI ownership to the same thread's nonblocking key-loop
++         * poll. No SPMI observation or new thread is used during sampling.
++         */
++        stream.branches=branches; stream.votes=votes; stream.pins=pins; stream.engine=engine;
++        stream.added_votes=added_votes; stream.pin4=p4; stream.pin5=p5; stream.route=saved_route;
++        for (unsigned i=0; i<6; ++i) stream.setup_saved[i]=setup_saved[i];
++        printf("SLIDER handoff key-worker owns controller; returning to physical keys\n");
++        return;
++    }
++    if (ist) idle=slider_idle(se);
+ done:
+     if (engine && configured && idle) {
+         for (unsigned i = 0; i < sizeof(setup_saved) / sizeof(setup_saved[0]); ++i) slider_write((void *)engine, setup_regs[i], setup_saved[i]);
+--- a/bsd/dev/Sm8250Keys.c
++++ b/bsd/dev/Sm8250Keys.c
+@@ -16,6 +16,8 @@
+ extern void thread_terminate_self(void);
+ extern bool sm8250_buttons_publish(uint32_t mask);
+ extern void sm8250_alert_slider_probe(void);
++extern void sm8250_alert_slider_poll(void);
++extern void sm8250_alert_slider_stop(void);
+ void sm8250_keys_start(void);
+ 
+ enum {KeyPollMs = 16, InvalidLimit = 8, SpmiCoreSpan = 0x2000};
+@@ -139,6 +141,7 @@
+                 complete = true;
+             }
+         }
++        sm8250_alert_slider_poll();
+         IOSleep(KeyPollMs);
+     }
+ }
+@@ -151,6 +154,7 @@
+     sm8250_alert_slider_probe();
+     if (spmi.core || spmi.cnfg || spmi.obsrvr) {
+         printf("KEY46 failed stage=arbiter-in-use\n");
++        sm8250_alert_slider_stop();
+         thread_terminate_self();
+         return;
+     }
+@@ -174,6 +178,7 @@
+         keys.down_enabled = gpio_ready(keys.down, KEBAB_KEYS_GPIO_DOWN_RT_STS & ~0xffu);
+         sample_keys(&keys);
+     }
++    sm8250_alert_slider_stop();
+     if (spmi.obsrvr) ml_io_unmap(spmi.obsrvr, KEBAB_SPMI_OBSRV_SIZE);
+     if (spmi.cnfg) ml_io_unmap(spmi.cnfg, KEBAB_SPMI_CNFG_SIZE);
+     if (spmi.core) ml_io_unmap(spmi.core, SpmiCoreSpan);

@@ -1,0 +1,217 @@
+--- a/bsd/dev/Sm8250TouchBoard.c
++++ b/bsd/dev/Sm8250TouchBoard.c
+@@ -89,10 +89,10 @@
+             ready = !(se & GccClockOff) &&
+                 (read_reg((void *)votes, GccWrap1Vote) & GccS5Vote);
+         }
+-        printf("TOUCH40 clocks ready=%u vote=%x m=%x s=%x se=%x cfg=%x dfs=%x perf0=%x\n",
++        printf("TOUCH41 clocks ready=%u vote=%x m=%x s=%x se=%x cfg=%x dfs=%x perf0=%x\n",
+             ready, vote, ma, sa, se, cfg, dfs, level0);
+     } else {
+-        printf("TOUCH40 clocks mapping failed\n");
++        printf("TOUCH41 clocks mapping failed\n");
+     }
+     if (votes) {
+         ml_io_unmap(votes, WindowSize);
+@@ -109,7 +109,7 @@
+     const uint32_t fw = read_reg(engine, GENI_FW_REVISION);
+     const uint32_t status = read_reg(engine, 0x40);
+     const uint32_t irq = read_reg(engine, GENI_M_IRQ_STATUS);
+-    printf("TOUCH40 engine fw=%x status=%x irq=%x\n", fw, status, irq);
++    printf("TOUCH41 engine fw=%x status=%x irq=%x\n", fw, status, irq);
+     if (((fw >> 8) & 0xff) != GENI_PROTO_I2C || (status & 0x1001) || irq ||
+         (read_reg(engine, GENI_IF_DISABLE) & 1) || read_reg(engine, 0xe18) ||
+         (read_reg(engine, GENI_DMA_MODE) & 1) || read_reg(engine, GENI_TX_WATERMARK) ||
+@@ -139,7 +139,7 @@
+     for (unsigned pin = 0; pin < 4; ++pin) {
+         uint32_t cfg = read_reg(pins, pin * TlmmPinStride);
+         if (cfg != 0 && cfg != 1) {
+-            printf("TOUCH40 GPIO%u refused config=%x\n", 36 + pin, cfg);
++            printf("TOUCH41 GPIO%u refused config=%x\n", 36 + pin, cfg);
+             return false;
+         }
+     }
+@@ -147,11 +147,11 @@
+     write_reg(pins, TlmmReset, TlmmOutputEnable);
+     if (read_reg(pins, TlmmReset) != TlmmOutputEnable ||
+         (read_reg(pins, TlmmReset + TlmmData) & TlmmOutputHigh)) {
+-        printf("TOUCH40 reset assertion failed\n");
++        printf("TOUCH41 reset assertion failed\n");
+         return false;
+     }
+     if (!sm8250_touch_power_on()) {
+-        printf("TOUCH40 power prerequisite failed, reset held low\n");
++        printf("TOUCH41 power prerequisite failed, reset held low\n");
+         return false;
+     }
+     write_reg(pins, 0, TlmmQup13);
+@@ -160,7 +160,7 @@
+     if (read_reg(pins, 0) != TlmmQup13 ||
+         read_reg(pins, TlmmPinStride) != TlmmQup13 ||
+         read_reg(pins, TlmmIrq) != 0) {
+-        printf("TOUCH40 pin mux readback failed, reset held low\n");
++        printf("TOUCH41 pin mux readback failed, reset held low\n");
+         return false;
+     }
+     write_reg(pins, TlmmReset + TlmmData, TlmmOutputHigh);
+@@ -169,7 +169,7 @@
+     uint32_t scl = read_reg(pins, TlmmPinStride + TlmmData);
+     uint32_t reset = read_reg(pins, TlmmReset + TlmmData);
+     bool ready = (sda & scl & TlmmInputHigh) && (reset & TlmmOutputHigh);
+-    printf("TOUCH40 pins ready=%u sda=%x scl=%x reset=%x irq=%x\n",
++    printf("TOUCH41 pins ready=%u sda=%x scl=%x reset=%x irq=%x\n",
+         ready, sda, scl, reset, read_reg(pins, TlmmIrq + TlmmData));
+     return ready;
+ }
+@@ -183,19 +183,19 @@
+ 
+     vm_offset_t engine = map_window(Se13Page);
+     if (!engine) {
+-        printf("TOUCH40 engine mapping failed\n");
++        printf("TOUCH41 engine mapping failed\n");
+         return;
+     }
+     if (prepare_engine((void *)engine)) {
+         vm_offset_t pins = map_window(TlmmGpio36Page);
+         if (!pins) {
+-            printf("TOUCH40 pins mapping failed\n");
++            printf("TOUCH41 pins mapping failed\n");
+         } else {
+             if (start_sensor((void *)pins)) {
+                 const GeniIo io = {read_reg, write_reg, (void *)engine};
+                 Sm8250TouchResult chip;
+                 int status = sm8250_touch_read_chip(&io, delay, &chip);
+-                printf("TOUCH40 result=%d config=%x reg=%02x boot=%02x integrity=%02x error=%d irq=%x\n",
++                printf("TOUCH41 result=%d config=%x reg=%02x boot=%02x integrity=%02x error=%d irq=%x\n",
+                     status, chip.config, chip.reg, chip.boot, chip.integrity, chip.error, chip.irq_status);
+             }
+             ml_io_unmap(pins, WindowSize);
+@@ -227,6 +227,6 @@
+     if (status == KERN_SUCCESS) {
+         thread_deallocate(worker);
+     } else {
+-        printf("TOUCH40 cannot start probe thread: %d\n", status);
+-    }
+-}
++        printf("TOUCH41 cannot start probe thread: %d\n", status);
++    }
++}
+--- a/bsd/dev/Sm8250TouchPower.c
++++ b/bsd/dev/Sm8250TouchPower.c
+@@ -80,10 +80,10 @@
+     const uint32_t ppid = (rail->sid << 8) | (rail->base >> 8);
+     const kebab_rpmh_status lookup = kebab_rpmh_cmd_db_lookup(db, CommandDbSize, rail->name, &addr);
+     const bool db_ok = lookup == KEBAB_RPMH_OK && addr == rail->addr;
+-    printf("TOUCH40 db %s lookup=%d addr=%x expected=%x\n", rail->name, lookup, addr, rail->addr);
++    printf("TOUCH41 db %s lookup=%d addr=%x expected=%x\n", rail->name, lookup, addr, rail->addr);
+     const uint32_t matches = kebab_spmi_scan(ppid, &match, 1);
+     if (matches != 1 || match.write_ee != 4) {
+-        printf("TOUCH40 rail %s observer refused ppid=%x matches=%u owner=%u\n",
++        printf("TOUCH41 rail %s observer refused ppid=%x matches=%u owner=%u\n",
+             rail->name, ppid, matches, matches == 1 ? match.write_ee : 0);
+         return false;
+     }
+@@ -94,7 +94,7 @@
+         read_pmic(rail, 0x40, &lo) && read_pmic(rail, 0x41, &hi) &&
+         read_pmic(rail, 0x46, &rail->enabled);
+     uint16_t mv = ((uint16_t)hi << 8) | lo;
+-    printf("TOUCH40 rail %s read=%u apid=%x type=%x/%x mv=%u en=%x\n",
++    printf("TOUCH41 rail %s read=%u apid=%x type=%x/%x mv=%u en=%x\n",
+         rail->name, readable, rail->apid, type, subtype, mv, rail->enabled);
+     return db_ok && readable && type == RegulatorType && subtype == rail->subtype &&
+         mv == rail->millivolts && (rail->enabled == 0 || rail->enabled == EnableOn);
+@@ -113,7 +113,7 @@
+     kebab_rpmh_status result = kebab_rpmh_tcs_send(channel, &command);
+     uint8_t en = 0;
+     bool on = result == KEBAB_RPMH_OK && read_pmic(rail, 0x46, &en) && en == EnableOn;
+-    printf("TOUCH40 rail %s send=%d phase=%u status=%x en=%x\n",
++    printf("TOUCH41 rail %s send=%d phase=%u status=%x en=%x\n",
+         rail->name, result, channel->phase, channel->last_status, en);
+     return on;
+ }
+@@ -125,22 +125,22 @@
+     uint32_t parent = kebab_spmi_rd(rsc, RscParentChild);
+     uint32_t irq_enable = kebab_spmi_rd(rsc + RscTcsBase, 0);
+     uint32_t irq_status = kebab_spmi_rd(rsc + RscTcsBase, 4);
+-    printf("TOUCH40 power version=%x parent=%x irq=%x/%x\n", version, parent, irq_enable, irq_status);
++    printf("TOUCH41 power version=%x parent=%x irq=%x/%x\n", version, parent, irq_enable, irq_status);
+     if (version < 0x50000000u || version >= 0x70000000u ||
+         ((parent >> 12) & 0x3f) != 8 || ((parent >> 27) & 0x1f) != 16 ||
+         ((irq_enable | irq_status) & (1u << 1))) {
+         return false;
+     }
+     if (db) {
+-        printf("TOUCH40 db header pa=%x size=%x version=%x magic=%x checksum=%x\n",
++        printf("TOUCH41 db header pa=%x size=%x version=%x magic=%x checksum=%x\n",
+             CommandDbPa, CommandDbSize, kebab_spmi_rd(db, 0), kebab_spmi_rd(db, 4), kebab_spmi_rd(db, 136));
+     } else {
+-        printf("TOUCH40 db mapping failed pa=%x size=%x\n", CommandDbPa, CommandDbSize);
++        printf("TOUCH41 db mapping failed pa=%x size=%x\n", CommandDbPa, CommandDbSize);
+     }
+     /* IN2020 stock order and voltages, GF SM8250 regulator identities. */
+-    struct rail digital = {.name = "ldoc1", .addr = 0x42f00, .sid = 5,
++    struct rail digital = {.name = "ldoc1", .addr = 0x43000, .sid = 5,
+                            .base = 0x4000, .millivolts = 1800, .subtype = 0x71};
+-    struct rail analog = {.name = "ldoa13", .addr = 0x40c00, .sid = 1,
++    struct rail analog = {.name = "ldoa13", .addr = 0x40d00, .sid = 1,
+                           .base = 0x4c00, .millivolts = 3008, .subtype = 0x7b};
+     const bool digital_ok = check_rail(&digital, (const uint8_t *)db);
+     const bool analog_ok = check_rail(&analog, (const uint8_t *)db);
+@@ -169,7 +169,7 @@
+     if (spmi.core && spmi.cnfg && spmi.obsrvr && rsc) {
+         ready = power_on(db, rsc);
+     } else {
+-        printf("TOUCH40 power mapping failed\n");
++        printf("TOUCH41 power mapping failed\n");
+     }
+     if (rsc) {
+         ml_io_unmap(rsc, RscSize);
+--- a/bsd/dev/KebabRpmhVrm.c
++++ b/bsd/dev/KebabRpmhVrm.c
+@@ -14,8 +14,8 @@
+ #endif
+ 
+ static const kebab_rpmh_resource kebab_resources[] = {
+-	{ "ldoa13", 0x00040c00u, 3008u },
+-	{ "ldoc1",  0x00042f00u, 1800u },
++	{ "ldoa13", 0x00040d00u, 3008u },
++	{ "ldoc1",  0x00043000u, 1800u },
+ };
+ 
+ static uint32_t rd32(const uint8_t *p)
+@@ -202,7 +202,7 @@
+ 			continue;
+ 		}
+ 		if (cnt > 1024u) {
+-			CMD_DB_TRACE("TOUCH40 db slot=%u slave=%u excessive count=%u\n",
++			CMD_DB_TRACE("TOUCH41 db slot=%u slave=%u excessive count=%u\n",
+ 			    i, slv, cnt);
+ 			return KEBAB_RPMH_ERR_COMMAND_DB;
+ 		}
+@@ -210,7 +210,7 @@
+ 			size_t e = 144u + (size_t)hdr_off + (size_t)j * 24u;
+ 
+ 			if (e + 24u > len) {
+-				CMD_DB_TRACE("TOUCH40 db slot=%u slave=%u entry=%u out of range\n",
++				CMD_DB_TRACE("TOUCH41 db slot=%u slave=%u entry=%u out of range\n",
+ 				    i, slv, j);
+ 				return KEBAB_RPMH_ERR_COMMAND_DB;
+ 			}
+@@ -218,7 +218,7 @@
+ 				continue;
+ 			}
+ 			if (found) {
+-				CMD_DB_TRACE("TOUCH40 db %s duplicate slot=%u slave=%u addr=%x\n",
++				CMD_DB_TRACE("TOUCH41 db %s duplicate slot=%u slave=%u addr=%x\n",
+ 				    name, i, slv, rd32(db + e + 16u));
+ 				return KEBAB_RPMH_ERR_DUPLICATE;
+ 			}
+@@ -227,7 +227,7 @@
+ 			 * legal address is a cross-mapping, not a hit. */
+ 			if (slv != KEBAB_RPMH_ACCEL_VREG ||
+ 			    rd32(db + e + 16u) != expect->addr) {
+-				CMD_DB_TRACE("TOUCH40 db %s slot=%u slave=%u addr=%x expected=%x\n",
++				CMD_DB_TRACE("TOUCH41 db %s slot=%u slave=%u addr=%x expected=%x\n",
+ 				    name, i, slv, rd32(db + e + 16u), expect->addr);
+ 				return KEBAB_RPMH_ERR_ADDRESS;
+ 			}

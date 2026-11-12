@@ -1,0 +1,41 @@
+# OnePlus 8 Pro (IN2020 / instantnoodlep), SM8250.
+#
+# First bring-up reaches the kernel; storage, display and input come later. The
+# archive builders the arch profile lists run because of CONFIG_XNU_BUILD_ARCHIVES.
+
+CONFIG_XNU_BUILD_ARCHIVES=y
+
+# Source providers that replace the ones the original kernelcache would supply.
+CONFIG_XNU_SOURCE_CORECRYPTO14=y
+CONFIG_XNU_SOURCE_PTHREAD=y
+
+# Platform, CPU and interrupt path.
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+# The original AMFI panics with "No PMGR?" without the bridge.
+CONFIG_XNU_SHENG_PMGR=y
+
+# 4 KiB page tables and the code-signing bridge for the 16 KiB kernelcache blobs.
+CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+CONFIG_XNU_TRUST_CACHE_RUNTIME=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_DT_PANIC_REGION=y
+
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+
+# UFS: this board uses its own SM8250 cold-start driver (drivers/Sm8250Ufs, built by
+# build-sm8250-ufs.py into build/sheng-ufs/libShengUfs.a). ShengUfs itself carries SM8550
+# constants and assumes firmware brought the link up, which this boot chain does not.
+CONFIG_XNU_NATIVE_UFS=y
+
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+
+# Independently seeded volatile writable APFS Data; root/SystemOS remain readonly.
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+
+# USB CDC logging: preserve the baseline warning policy and add only this module.
+CONFIG_XNU_EXTRA_CFLAGS="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding -DXNU_QCOM_USB_DEBUG=1 -I{tree}/kits/instantnoodlep/QcomXnuUsbDebug/include"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/qcom-usb-debug/libQcomXnuUsbDebug.a"

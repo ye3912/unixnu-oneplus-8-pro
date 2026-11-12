@@ -1,0 +1,152 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -80,6 +80,7 @@
+  */
+ 
+ #include <sys/param.h>
++#include <libkern/crypto/sha2.h>
+ #include <sys/filedesc.h>
+ #include <sys/kernel.h>
+ #include <sys/mount_internal.h>
+@@ -1412,6 +1413,90 @@
+  return error;
+ }
+ 
++
++/* R23: GF0287 native RO union method, actual21H461 original library pins.
++ * Copyright (c) 2026 UniXNU contributors. BSD-2-Clause-Patent; see reference/GF-LICENSE. */
++extern int bindfs_getbackingvnode(vnode_t, vnode_t *);
++static int
++smufs_library_verify(const char *path, mount_t expected, uint64_t bytes, const uint8_t hash[32])
++{
++ vnode_t node=NULLVP;vfs_context_t ctx=vfs_context_kernel();
++ int error=vnode_lookup(path,VNODE_LOOKUP_NOFOLLOW,&node,ctx);
++ if(error)return error;
++ uint8_t *buffer=NULL,digest[32];
++ struct vnode_attr va;VATTR_INIT(&va);VATTR_WANTED(&va,va_data_size);
++ if(!vnode_isreg(node) || vnode_mount(node)!=expected || !(vfs_flags(expected)&MNT_RDONLY))error=EAUTH;
++ if(!error)error=vnode_getattr(node,&va,ctx);
++ if(!error && (!VATTR_IS_SUPPORTED(&va,va_data_size) || va.va_data_size!=bytes))error=EAUTH;
++ if(!error){buffer=kalloc_data(16384,Z_WAITOK);if(!buffer)error=ENOMEM;}
++ SHA256_CTX digest_ctx;SHA256_Init(&digest_ctx);
++ for(uint64_t offset=0;!error && offset<bytes;) {
++  int take=(int)((bytes-offset)>16384?16384:bytes-offset),residual=take;
++  error=vn_rdwr(UIO_READ,node,(caddr_t)buffer,take,(off_t)offset,UIO_SYSSPACE,0,vfs_context_ucred(ctx),&residual,current_proc());
++  if(!error && residual)error=EIO;
++  if(!error)SHA256_Update(&digest_ctx,buffer,(size_t)take);
++  offset+=(uint64_t)take;
++ }
++ SHA256_Final(digest,&digest_ctx);
++ if(!error && memcmp(digest,hash,sizeof(digest)))error=EAUTH;
++ if(buffer)kfree_data(buffer,16384);
++ vnode_put(node);return error;
++}
++
++__attribute__((noinline)) static int
++smufs_cryptex_libraries_prepare(struct SmUfsCacheProbe *cache)
++{
++ static const struct {const char *name;uint64_t bytes;uint8_t hash[32];} files[]={{"libobjc-trampolines.dylib",68080, {0x80,0x89,0xb4,0x43,0x22,0x32,0xe5,0x64,0x64,0xce,0x72,0x4e,0x1e,0xf3,0x34,0xe5,0xb9,0x5d,0xfc,0x0e,0xaa,0x33,0xea,0xcc,0x8e,0xb2,0xa7,0x6b,0x66,0x97,0x44,0xd4}},
++{"libffi-trampolines.dylib",51504, {0xd3,0xd1,0xac,0xd3,0x90,0x7b,0x5e,0xc3,0x64,0xd7,0x1a,0x40,0x8f,0xd6,0x6d,0xc9,0xfb,0xd4,0x04,0x04,0xb7,0xc2,0xa2,0xa4,0x75,0x37,0x91,0xe1,0xc3,0x29,0xbf,0x0d}},
++{"libstdc++.6.0.9.dylib",819568, {0xa0,0x2d,0xf3,0xdf,0xc3,0xcf,0x9a,0xb2,0x48,0x4e,0xfa,0x6c,0x12,0xae,0xb1,0xec,0x8f,0x7f,0x8b,0x68,0xe7,0x74,0x08,0xfc,0xac,0x37,0x17,0x29,0xd9,0xcc,0xc0,0xdc}}};
++ static const char source[]="/private/preboot/usr/lib",target[]="/usr/lib";
++ const int flags=MNT_RDONLY|MNT_UNION|MNT_NOSUID|MNT_NODEV;
++ vnode_t upper=NULLVP,lower=NULLVP,visible=NULLVP,backing=NULLVP,old_dyld=NULLVP,new_dyld=NULLVP;
++ vnode_t original_root=rootvnode;mount_t root_mount=vnode_mount(original_root);vfs_context_t ctx=vfs_context_kernel();
++ int error=0;unsigned verified=0,stage=1;
++ if(proc_getpid(current_proc())!=1 || !cache || cache->mode!=3 || cache->original_root!=original_root ||
++  !smufs_cache_root_valid() || !smufs_cache_integrity_valid(cache,1) || !cache->readonly ||
++  !cache->system_mount || cache->system_mount==root_mount || !(vfs_flags(root_mount)&MNT_RDONLY))return EAUTH;
++ error=vnode_lookup(source,VNODE_LOOKUP_NOFOLLOW,&upper,ctx);
++ if(!error && (!vnode_isdir(upper) || vnode_mount(upper)!=cache->system_mount))error=EAUTH;
++ if(!error)error=vnode_lookup(target,VNODE_LOOKUP_NOFOLLOW,&lower,ctx);
++ if(!error && (!vnode_isdir(lower) || vnode_mount(lower)!=root_mount))error=EAUTH;
++ if(!error)error=vnode_lookup("/usr/lib/dyld",VNODE_LOOKUP_NOFOLLOW,&old_dyld,ctx);
++ if(!error && (!vnode_isreg(old_dyld) || vnode_mount(old_dyld)!=root_mount))error=EAUTH;
++ for(unsigned i=0;!error && i<sizeof(files)/sizeof(files[0]);++i) {
++  char path[MAXPATHLEN];snprintf(path,sizeof(path),"%s/%s",source,files[i].name);
++  error=smufs_library_verify(path,cache->system_mount,files[i].bytes,files[i].hash);
++  if(!error)++verified;
++ }
++ stage=2;
++ if(!error)error=kernel_mount("bindfs",NULLVP,NULLVP,target,(void *)source,sizeof(source),flags,0,ctx);
++ stage=3;
++ if(!error)error=vnode_lookup(target,VNODE_LOOKUP_NOFOLLOW,&visible,ctx);
++ if(!error && (strcmp(vfs_statfs(vnode_mount(visible))->f_fstypename,"bindfs") ||
++    (vfs_flags(vnode_mount(visible))&flags)!=(uint64_t)flags))error=EAUTH;
++ if(!error)error=bindfs_getbackingvnode(visible,&backing);
++ if(!error && backing!=upper)error=EAUTH;
++ if(backing){vnode_put(backing);backing=NULLVP;}
++ for(unsigned i=0;!error && i<sizeof(files)/sizeof(files[0]);++i) {
++  char path[MAXPATHLEN];vnode_t file=NULLVP;snprintf(path,sizeof(path),"%s/%s",target,files[i].name);
++  error=vnode_lookup(path,VNODE_LOOKUP_NOFOLLOW,&file,ctx);
++  if(!error)error=bindfs_getbackingvnode(file,&backing);
++  if(!error && (!vnode_isreg(backing) || vnode_mount(backing)!=cache->system_mount))error=EAUTH;
++  if(backing){vnode_put(backing);backing=NULLVP;}
++  if(file)vnode_put(file);
++ }
++ stage=4;
++ if(!error)error=vnode_lookup("/usr/lib/dyld",VNODE_LOOKUP_NOFOLLOW,&new_dyld,ctx);
++ if(!error && new_dyld!=old_dyld)error=EAUTH;
++ if(!error && (rootvnode!=original_root || vnode_mount(rootvnode)!=root_mount || !smufs_cache_root_valid() ||
++   !(vfs_flags(root_mount)&MNT_RDONLY) || !smufs_cache_integrity_valid(cache,1)))error=EAUTH;
++ if(new_dyld)vnode_put(new_dyld);if(old_dyld)vnode_put(old_dyld);
++ if(visible)vnode_put(visible);if(lower)vnode_put(lower);if(upper)vnode_put(upper);
++ printf("SMULIB23 stage%u errno%d original%u/3 readonly-union%u root-same%u dyld-same%u\n",stage,error,verified,error?0U:1U,
++  rootvnode==original_root?1U:0U,new_dyld && new_dyld==old_dyld?1U:0U);
++ return error;
++}
++
+ __attribute__((noinline)) uint64_t
+ native_smufs_cache_prepare(uint64_t scratch)
+ {
+@@ -1483,6 +1568,8 @@
+   v->root_same=rootvnode==v->original_root;v->root_after=smufs_cache_root_valid();
+   if(!v->root_same||!v->root_after||!smufs_cache_integrity_valid(v,1)){v->error=EAUTH;smufs_cache_probe_report("continue-policy",v);}
+   if(!native_smufs_bootset_publish((uint32_t)rootdev,v->selected,smufs_saved_autherr,v->media)){v->error=EAUTH;smufs_cache_probe_report("bootset-publication",v);}
++  v->error=smufs_cryptex_libraries_prepare(v);
++  if(v->error)panic("SMULIB23 original library namespace refused errno%d",v->error);
+   v->error=smufs_data_prepare(scratch,v);
+   if(v->error)panic("SMUFS data-h3t prepare refused %s",smufs_data_note());
+   v->error=native_smufs_boot_status_prepare();
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -106,6 +106,20 @@
+ /*
+  * Mount bind layer
+  */
++
++/* GF0287: kernel pointers are accepted only for a real kernel-context mount.
++ * Ordinary syscall entitlement/copyinstr behavior remains in bindfs_mount. */
++static int
++smufs_bindfs_kernel_path(struct mount *mp,user_addr_t input,vfs_context_t ctx,char data[MAXPATHLEN],size_t *count)
++{
++ if(!vfs_context_iskernel(ctx) || !(mp->mnt_kern_flag&MNTK_KERNEL_MOUNT))return EPERM;
++ if(!input)return EFAULT;
++ const char *path=(const char *)(uintptr_t)input;size_t length=strnlen(path,MAXPATHLEN);
++ if(length==MAXPATHLEN)return ENAMETOOLONG;
++ if(!length)return EINVAL;
++ *count=length+1;memcpy(data,path,*count);return 0;
++}
++
+ static int
+ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, vfs_context_t ctx)
+ {
+@@ -143,13 +157,17 @@
+ 
+ 	/* check entitlement; the boot-time addon mount (kern_exec.c native_gpu_addon_prepare) runs before any
+ 	 * entitled process exists and sets this flag around its own mount() call only */
+-	if (!native_bindfs_boot_mount && !IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT)) {
++	if (!(vfs_context_iskernel(ctx) && (mp->mnt_kern_flag & MNTK_KERNEL_MOUNT)) &&
++	    !native_bindfs_boot_mount && !IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT)) {
+ 		return EPERM;
+ 	}
+ 
+ 	/*
+ 	 * Get argument
+ 	 */
++	if (vfs_context_iskernel(ctx) && (mp->mnt_kern_flag & MNTK_KERNEL_MOUNT))
++		error = smufs_bindfs_kernel_path(mp,user_data,ctx,data,&count);
++	else
+ 	error = copyinstr(user_data, data, MAXPATHLEN - 1, &count);
+ 	if (error) {
+ 		BINDFSERROR("error copying data from user %d\n", error);

@@ -1,0 +1,43 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4359,6 +4359,9 @@
+ 	return false;
+ }
+ 
++extern "C" bool native_smufs_watchdog_is_service(IOService *);
++extern "C" void native_smufs_watchdog_open_policy_observe(IOService *, unsigned, int, int);
++
+ kern_return_t
+ is_io_service_open_extended(
+ 	io_object_t _service,
+@@ -4387,8 +4390,17 @@
+ 	}
+ 
+ #if CONFIG_MACF
+-	if (!native_sandbox_grant(service) && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
+-		return kIOReturnNotPermitted;
++	if (!native_sandbox_grant(service)) {
++		kauth_cred_t credential = kauth_cred_get();
++		int policyError = mac_iokit_check_open_service(credential, service, connect_type);
++		if (native_smufs_watchdog_is_service(service)) {
++			IOService *control = IOService::getResourceService();
++			int controlError = control ? mac_iokit_check_open_service(credential, control, connect_type) : -1;
++			native_smufs_watchdog_open_policy_observe(service, connect_type, policyError, controlError);
++		}
++		if (policyError != 0) {
++			return kIOReturnNotPermitted;
++		}
+ 	}
+ #endif
+ 	do{
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1253,7 +1253,7 @@
+ {
+  static char note[4096];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3v prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s%s%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3w prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),

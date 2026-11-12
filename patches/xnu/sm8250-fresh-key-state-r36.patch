@@ -1,0 +1,30 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1312,6 +1312,14 @@
+  uint64_t bytes;
+  char device[64];
+ } smufs_data_state;
++
++static unsigned smufs_aks_fresh_data;
++int
++smufs_aks_fresh_data_ready(void)
++{
++ return __atomic_load_n(&smufs_aks_fresh_data,__ATOMIC_ACQUIRE)==1 &&
++     native_data_persist_state==0;
++}
+ 
+ static int
+ smufs_data_seed_matches(uint32_t device,uint64_t bytes,const uint8_t hash[32],
+@@ -1409,7 +1417,11 @@
+  if(data_root)vnode_put(data_root);
+  if(d)kfree_data(d,sizeof(*d));
+  smufs_data_state.error=error;
+- if(!error)printf("SMUFS data-h3t prepared %s",smufs_data_note());
++ if(!error && smufs_data_state.stage==5) {
++  __atomic_store_n(&smufs_aks_fresh_data,1,__ATOMIC_RELEASE);
++  printf("KEYSTATE36 verified factory RAM Data, state queries eligible\n");
++  printf("SMUFS data-h3t prepared %s",smufs_data_note());
++ }
+  return error;
+ }
+ 

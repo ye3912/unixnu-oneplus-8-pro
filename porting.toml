@@ -1,0 +1,962 @@
+schema_version = 1
+
+[device]
+name = "instantnoodlep"
+soc = "SM8250"
+os_profile = "ipados-17.7.11-21H461"
+summary = "OnePlus 8 Pro (IN2020), XNU10063/4KiB and iPadOS21H461. H3G hardware: original PID1 mprotect handler returned0 for32KiB VM_PROT_READ; H3H observes same-thread later EL0 SVC."
+
+[[area]]
+id = "configuration"
+status = "implemented"
+components = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot"]
+paths = ["board.toml", "feeds.toml", "configs/**", ".github/**", ".gitignore"]
+inputs = [
+  "SoC: Qualcomm SM8250 (kona). Device: OnePlus 8 Pro, IN2020.",
+  "OS profile: ipados-17.7.11-21H461, inherited unchanged from sheng.",
+  "SoC source: UniXNU-sm8250-common.",
+]
+configuration = [
+  "board.toml: soc = SM8250, soc_source = sm8250, os_profile = ipados-17.7.11-21H461, kit = instantnoodlep.",
+  "components.include: ArmDTPlatform, ArmCpu, SoftwareAES, XnuPrelink, DarwinBoot.",
+  "kernel.config_fragments and kernel.patch_series carry the full ordered arrays.",
+  "payload.dram_size = 0x200000000 equals the memory node size; the ADT step rejects a mismatch.",
+]
+procedure = [
+  "./unixnu defconfig instantnoodlep_defconfig -D ../UniXNU-instantnoodlep",
+  "./unixnu status --json -D ../UniXNU-instantnoodlep",
+]
+findings = [
+  "Kernel probe level advanced to 25: 21 pre-ring dashboard, 22 empty UTRD, 23 HIBER_EXIT then TUR, 24 HIBER_EXIT plus UIC error codes, 25 full cold start then TUR; level 15 is reused with the STORAGE=1/TRUSTZONE=1 firmware to preserve the vendor UFS init. The QR-enabled firmware image also sets payload tools=true, adding the Tools menu. Images and hashes are archived under builds/2026-10-28.",
+  "The vendor keeps the board device tree split: the boot image carries base kona trees with board-id 0, dtbo.img carries nine overlays selected at runtime, and dtbo entry 0 is this board (model 'kona MTP 19811').",
+  "The UEFI firmware lives in the xbl partition, not in a separate uefi partition: SEC core plus one DXE volume compressed under a custom GUID 1d301fe9-be79-4353-91c2-d23bc959ae0c, which UEFIReader handles and a plain FFS parser does not.",
+]
+completion = ["All source pins resolve; status shows four merged profiles, the five components in dependency order, and an empty device patch series."]
+limits = ["The SoC repository is unpublished and reached through a local path in feeds.toml."]
+next_action = ["Publish UniXNU-sm8250-common and pin its commit in feeds.toml."]
+evidence = [
+  { kind = "source", reference = "board.toml", result = "Declares the four merged layers, the five selected components and the ordered patch series the checker resolves" },
+]
+
+[[area]]
+id = "firmware"
+status = "implemented"
+components = []
+paths = ["proprietary-files.txt", "scripts/extract-files.py", "scripts/gen-touch-firmware.py"]
+inputs = [
+  "Mu-Silicium platform package instantnoodlepPkg, FD base 0x9FC00000 size 0x300000, BootShim with the ARM64 image header.",
+  "Boot image: Android boot v1, kernel field gzip(BootShim + FD) + appended device tree, ramdisk = payload FAT volume.",
+  "Appended device tree: the vendor tree instantnoodlep-dtb/instantnoodlep.dtb (723,328 bytes), which carries qcom,msm-id, qcom,board-id and /chosen. The 2 KB ADT tree (device-tree/hardware.dtb) is for the kernel only.",
+]
+configuration = [
+  "VENDOR_HW=1, STORAGE=0, TRUSTZONE=0, USE_CUSTOM_DISPLAY_DRIVER=0 in instantnoodlep.dsc.",
+  "bootimg --dtb must point at the vendor tree; the payload ADT is generated from device:dts/instantnoodlep.dts plus soc:dts.",
+]
+procedure = [
+  "Build kernel, payload and firmware, then pack the boot image with the vendor device tree and flash it to boot_a.",
+]
+findings = [
+  "On 2026-10-27 the boot image was repacked with the 2 KB ADT tree instead of the vendor tree; every image from 14:13 onward was then refused by ABL and returned to fastboot with no UEFI output, while images carrying the 723 KB vendor tree still printed the DXE log.",
+  "The vendor tree is what ABL uses for platform matching and for writing /chosen/linux,initrd-start and -end; the UniXNURamDiskDxe handoff depends on those properties.",
+  "The flashed FD is built with INSTANTNOODLEP_STORAGE=0 and INSTANTNOODLEP_TRUSTZONE=0: APRIORI.inc/DXE.inc include SdccDxe/UFSDxe only when STORAGE=1, so the vendor UFS DXE and TzDxe are absent. Kebab includes both unconditionally and its kernel UFS driver relies on the firmware host/domain state.",
+  "full25 proved the kernel can run the complete PHY/BCR/HCE/link cold start (cold/link/DP blocks green) but the UTRL doorbell store still does not retire. The missing vendor UFS DXE/TZ handoff is therefore the leading remaining difference.",
+  "The STORAGE=1/TRUSTZONE=1 firmware build includes UFSDxe (GUID 0d35cd8e-97ea-4f9a-96af0f0d89f76567) and seven additional TZ/PIL/SPSS/Sdcc modules; the FD stays 0x300000 (sha256 73cd521b...). It is paired with probe=15 (kebab takeover, no kernel cold start) in boot-ufsdxe15.img so the vendor host init/domain is preserved.",
+  "AdvancedLogDxe (GUID 8d4e7f50-3a2c-4c9a-9e1b-50c4c8472d41) and QrEncoderLib are now integrated; the FD has 93 modules and sha256 189defe1..., and payload tools=true adds the Tools menu entry. The QR-enabled image is boot-ufsdxe-qr15.img.",
+  "The STORAGE=1/TRUSTZONE=1 QR image does not reach the menu on hardware; the vendor UFSDxe/TZ chain is fatal before BDS. A second build keeps STORAGE=1 but sets TRUSTZONE=0 (FD 850203e9..., 88 modules, UFSDxe + AdvancedLogDxe, no TZ), image boot-ufsdxe-qr-notz15.img, to isolate UFSDxe from the TZ chain.",
+  "The no-TZ image still does not reach the menu: it asserts in ArmCpuDxe/CpuExceptionHandlerLib with ESR EC=0 (unknown/SError class) and frames in ArmGulba/BootCore. STORAGE=1 also includes SdccDxe, and this board has no usable SD path, so SdccDxe is a plausible cause. The next build removes SdccDxe (FD 7fd25ef3..., 87 modules, UFSDxe + AdvancedLogDxe only), image boot-ufsdxe-qr-nosdcc15.img.",
+  "The exception is also new relative to the working STORAGE=0 firmware, so the AdvancedLogDxe/DebugLib mapping itself is a variable. A control build keeps STORAGE=0/TRUSTZONE=0, keeps AdvancedLogDxe/QrEncoderLib and tools, and removes UFSDxe/SdccDxe (FD de49b348..., 86 modules), image boot-qr-control15.img. It must boot before the UFSDxe image can be interpreted.",
+  "Control result on hardware (2026-10-29): the menu appears and Tools -> Advanced Logger opens. The logger/DebugLib chain is sound; the ArmCpuDxe assert with the UFSDxe builds comes from UFSDxe or SdccDxe.",
+  "The UFSDxe-only no-TZ no-Sdcc image also fails before the menu, so UFSDxe alone asserts. The last untested quadrant is UFSDxe + TZ without Sdcc (FD 176c0e25..., 92 modules, UFSDxe + TZ 1c04f529 + AdvancedLogDxe), image boot-ufsdxe-tz-qr-nosdcc15.img.",
+  "The UFSDxe + TZ no-Sdcc image also asserts before the menu. All four vendor UFSDxe combinations (with/without TZ, with/without Sdcc) fail. The vendor UFSDxe cannot be enabled on this Mu-Silicium chain as-is: it raises an exception in ArmCpuDxe/CpuExceptionHandlerLib rather than returning a recoverable DXE error.",
+  "A local UefiCpuPkg/CpuExceptionHandlerLib patch adds a DXE-only Adv library instance (DxeCpuExceptionHandlerLibAdv, GUID ...E02E) that captures the Advanced Logger tail at the start of DumpCpuContext and prints it to ConOut before ASSERT; the ArmCpuDxe component in the platform DSC overrides CpuExceptionHandlerLib to this instance. The FD is 77893447... and the image is boot-ufsdxe-tz-qr-exc15.img.",
+  "exc15 on hardware: the assert text appears but no 'Advanced Logger tail:' line. Root cause traced in the sources, not guessed: the tail was printed through gST->ConOut, which does not exist yet at that point. APRIORI.inc puts UFSDxe at line 56 and TzDxe at line 64, while SimpleTextInOutSerial/ConSplitter/GraphicsConsoleDxe only dispatch at lines 102-105, so gST->ConOut is NULL and PrintAdvancedLoggerTail returned silently. The rest of DumpCpuContext is visible because it goes through SerialPortWrite, which the platform maps to SiliciumPkg/FrameBufferSerialPortLib (SiliciumPkg.dsc.inc:162) and paints the framebuffer directly.",
+  "Capture itself was not the problem: DxeCore.efi contains gAdvancedLoggerProtocolGuid, so the logger protocol exists before any DXE driver, and the access library's [Depex] gAdvancedLoggerProtocolGuid merged into ArmCpuDxe, which therefore cannot dispatch before the protocol is published. mLoggerInfo was resolved, and the tail data was in the ring but never printed.",
+  "Run 2 (boot-ufsdxe-tz-qr-exc15b.img, FD aed31e98..., image 74924e22..., 93,929,472 B): PrintAdvancedLoggerTail now writes through SerialPortWrite and the header reports the entry count and the final access-library status, so an empty capture is distinguishable from a missing logger. Verified end to end: embedded FD equals the rebuilt FD, the new ArmCpuDxe (62ded8ba...) is inside the LZMA inner FV, the vendor DTB is the 723,328-byte tree, and the payload kernel.macho is unchanged (4412b0fb...).",
+  "Expectation for the vendor stage: UFSDxe and TzDxe are prebuilt binaries under Binaries/instantnoodlep, so their own DEBUG/ASSERT text goes to the vendor's serial debug library and does not enter our Advanced Logger. The tail can therefore only show how far DXE dispatch got and what our own modules did last; it cannot contain UFSDxe's internal failure message.",
+  "UFSDxe binary analysis (Binaries/instantnoodlep/QcomPkg/Drivers/UFSDxe/UFSDxe.efi, FFS GUID 0d35cd8e-97ea-4f9a-96af0f0d89f76567, 0x220d6 bytes): its DXE_DEPEX requires nine protocols (157a5c45..., b0760469..., 5bef7c41..., c1bff82d..., a966cc4f..., 47861dff..., ad9aec18..., b27ae8b1..., f4e5c7d0-d239-47cb-7f66ef763238). ScmDxeLA sits in APRIORI outside the TRUSTZONE gate, so the SCM protocol exists even in the TZ=0 builds and UFSDxe does dispatch there; its failure is a runtime fault, not a missing dependency.",
+  "UFSDxe strings describe its runtime flow: Locate TzeLoader/Qseecom, Loading storsec from TZAPPS (qcom.tz.storsecapp), UFS IOMMU domain create/configure/attach ARID 0x10 (card ARID 0x0), Failed to map UFS_MEM_UFS, EnableUfsIOC, the nine gcc_ufs_phy_* clocks, /pmic/client/ufs0, and OnePlus-specific UFS firmware upgrade from oplusreserve1. It also carries 'SerialPort Lib' and the standard DebugLib/ASSERT strings, i.e. its debug output goes through its own linked SerialPortLib instance, not ConOut and not our Advanced Logger, so reordering it after the console drivers would not reveal its messages.",
+  "Upstream kebabPkg in the same Mu-Silicium tree includes UFSDxe and TzDxe unconditionally (APRIORI.inc lines 20/31/44/48) and has no STORAGE/TRUSTZONE switches; its MemoryMapLib also has no separate UFS/ICE descriptor because both fall inside APSS_HM (0x17800000, 0x0d981000), exactly as in instantnoodlepPkg. There is no memory-map or module-roster difference to copy; the kebab vendor binaries themselves are not in the tree (only Binaries/instantnoodlep is present).",
+  "exc15c (boot-ufsdxe-tz-qr-exc15c.img, image e59dd8e7..., FD e9c80d05..., 93,929,472 B) adds a compact FAULT EC/IL/ESR/ELR/FAR line immediately before the tail header, so the register-based diagnosis sits at the bottom of the screen instead of above ~50 lines of CPU dump. Verified: embedded FD matches, the new ArmCpuDxe (d2e6756a...) is inside the inner FV, the DTB is the 723,328-byte vendor tree.",
+  "Hardware log (2026-10-29) names the vendor failure: UFSDxe loads, prints ufs_error_log: 28b, then ASSERT_EFI_ERROR (Status = Device Error) and ASSERT UFS.c +1029. Static decode: 0x28b is emitted by the low-level execute path when the command returns its internal -1000 retry sentinel and the follow-up response read then fails; the function that logs it builds a SCSI WRITE(10) CDB (opcode 0x2A), consistent with the OnePlus ufs_set_pon_write_protect string. The UFS.c:1029 assert is secondary: the request-object allocator (about 20 slots) returns NULL and the code asserts EFI_DEVICE_ERROR. So the root event is a non-completing write command, not the assert.",
+  "Stock images (C:/Users/29664/Desktop/images): xbl_a.img is ELF64 with one FV whose DXE volume is GZip-compressed under the custom GUID 1d301fe9-be79-4353-91c2-d23bc959ae0c (UEFIReader's ZLib/GZip branch, not LZMA). Decompressed, it contains a valid IORT (4468 B, QCOM) with named-component entries for \\_SB_.UFS0, but no DSDT (ACPI tables are built from ASL at runtime), and abl_a.img has no DSDT either. The stock APRIORI.inc lists no ACPI drivers at all and puts TzDxeLA at line 9, before UFSDxe at line 55.",
+  "Therefore the ACPI/UFS0 gap is real (instantnoodlep DSDT is 354 B with only CPU0-7; UFSDxe references \\_SB_.UFS0) but is not the entry-time blocker: stock dispatches UFSDxe before any ACPI platform driver too. An SSDT adding UFS0 (MMIO 0x1D84000/0x1C000, IRQ 265 from the board DTS, DEV0 _ADR 8) was compiled but deliberately not integrated.",
+  "The remaining concrete ordering delta: our APRIORI put UFSDxe at line 56 and TzDxeLA at line 64, i.e. after it, while stock puts TzDxeLA at line 9. Since the failing WRITE goes through storsec/ICE, UFSDxe may run before the TZ services it needs. boot-ufsdxe-tzfirst15.img moves the TzDxeLA block before the UFSDxe block and changes nothing else (image 1a930f84..., FD 6be7ecf8...). Hardware still reported ufs_error_log: 28b + UFS.c:1029, so the ordering is not the cause.",
+  "Reverse engineering pinned the failing function: ufs_set_pon_write_protect at RVA 0x28cc (reached through the RVA table at 0x18790 with entries 0x27a4/0x28cc/0x2c48/0x305c/0x2bf0). It locks, calls 0xcf08, and on failure prints 'ufs_set_pon_write_protect with return value of %d' and returns EFI_DEVICE_ERROR; the caller then exhausts the fixed request pool and asserts at UFS.c:1029. So the root event is the OnePlus power-on write protection write failing, not the assert.",
+  "Non-fatal experiment: UFSDxe.efi was patched at 0x28cc to 'mov w0,#0; ret' (original sha 38d0db94..., patched a3fcc1ff..., backup kept as UFSDxe.efi.orig; script tools/patch-ufsdxe-writeprotect.py). Write protection is not required to read or mount the device. Image boot-ufsdxe-nowp15.img (image 24c27ace..., FD f0309c52...), verified to contain the patched module with 00 00 80 52 c0 03 5f d6 at 0x28cc.",
+  "Correction after re-checking function boundaries: 0xdce4 belongs to the function at 0xdc08, which issues TEST UNIT READY (CDB[0]=0), not to the WRITE(10) or WRITE BUFFER functions. The write-protect, short-transfer and FFU-skip patches were based on wrong function attribution and changed nothing on hardware; the stock UFSDxe was restored (38d0db94...).",
+  "GFander published GFander/kebab-UEFI with the missing recipe in patches/0002-kebab-boot-to-BDS-UFS-init-no-longer-fatal.patch: (1) ConfigurationMapLib EnableUfsIOC 0->1, without which UFSDxe asserts with Device Error and CpuDeadLoop()s the machine; (2) MemoryMapLib gains a UFS UFS REGS MMIO descriptor at 0x01D80000/0x20000; (3) a CPU Vectors 0x9FF8C000 entry that instantnoodlep already has. instantnoodlepPkg had EnableUfsIOC 0. Both changes are applied; image boot-ufsdxe-ioc15.img (image 816b98a5..., FD ab7726fe...).",
+  "Expectation from GF's own note: this makes the machine reach BDS with the menu while UFSDxe may still report UFS errors and expose no block device; his working root filesystem comes from the kernel driver, not from UFSDxe. The repo also carries a source UEFI UFS driver at src/Silicon/Silicium/SiliciumPkg/Drivers/QcomUfsDxe/QcomUfsDxe.c.",
+  "Clean rebuild after concurrent edits (2026-10-29): the firmware tree was verified coherent (one EnableUfsIOC=1 entry, one UFS UFS REGS descriptor, stock UFSDxe 38d0db94, no duplicate lines) and rebuilt with Build/instantnoodlepPkg removed first. Image boot-ufsdxe-ioc-clean15.img (image 9991da17..., FD 5d8d748a..., 0x300000), UFSDxe 38d0db94 inside the FV, vendor DTB 723,328 B. Note the FV also embeds a vendor text blob 'EnableUfsIOC = 0' (default cfg); GF's patch changed only the ConfigurationMapLib table, which is the effective source, so the text blob was left untouched.",
+  "Full reverse of the vendor UFSDxe (tools/ufsd-re-analyze.py, report ufsdxe-full-re.md; supersedes the two findings above): EfiEntry 0x114c -> init 0x33f4 maps +UFS_MEM_UFS via the HWIO protocol, configures the HALIOMMU domain (the UFS0 ACPI device, ARID 0x10, protocol 54B6D3B4-...) successfully, then calls UfsAllocAndExecute 0xcc78 which lazily runs UfsHwInit 0x11a24 (register base hardcoded 0x1D80000 so +0x40xx equals 0x1D84000+standard offsets; PHY pokes 0x1D98004=0x5F, 0x1D87C00, 0x1D870BC; HCE=0, CFG1=0x1800052E, UIC work, HCE=1; a fresh 0x1400 page into UTRLBA and UTMRLBA; poll UTRLRDY; UTRLRSR=1 and never stopped) and executes TEST UNIT READY as the first command.",
+  "The TUR answers SCSI CHECK CONDITION (response UPIU status 2) with sense data; the driver parses the sense and only retries UNIT ATTENTION (key 6), so any other key logs 0x28b and UfsAllocAndExecute returns NULL, which is the UFS.c:1029 assert at 0x35d0 in init 0x33f4. No 0x2a0/0x2a1 log lines appear, so the sense format is valid. The UTP transport (doorbell, fetch, response, sense) therefore works in our firmware - the assert is a device-state refusal, not a DMA/IOMMU or register-map problem. The vendor doorbell is a plain slot-mask store to regs+0x58 with DMB and cache-clean of UCD/PRDT before it.",
+  "Hardware with boot-ufsdxe-sensekey15.img read the sense key as 2 (NOT READY). Earlier vendor-binary patches (PON write protect 0x28cc, short-transfer 0xff04, FFU 0x12410) were built on misread function boundaries, changed nothing and are reverted; UFSDxe.efi.orig (38d0db94...) is the stock binary.",
+  "Open-source UFS stack built (2026-10-29 late, Mu-Silicium-beta branch oss-ufs, commit 8e8bc70): GF's route is firmware-side, not a kernel driver. A 419-line QcomUfsDxe adapter (kebab-uefi/QcomUfsDxe.c) provides EDKII_UFS_HOST_CONTROLLER_PROTOCOL and EDKII_UFS_HC_PLATFORM_PROTOCOL at 0x01D84000 with SkipHceReenable/SkipLinkStartup set, so EDK2's UfsPassThruDxe can send fDeviceInit (UfsPassThru.c:767 UfsSetFlag(UfsFlagDevInit), then UfsReadFlag; PcdUfsInitialCompletionTimeout 600000 us) without disturbing the ABL link. The adapter also records CBAR0 type S1_TRANS_S2_BYPASS and TTBR0 = 0, so UFS DMA uses physical addresses and no HALIOMMU domain is needed. Integrated as instantnoodlepPkg/Drivers/QcomUfsDxe plus MdeModulePkg UfsPassThruDxe, ScsiBusDxe and ScsiDiskDxe in the DSC [Components] and DXE.inc, with UefiScsiLib|MdePkg/Library/UefiScsiLib/UefiScsiLib.inf mapped; the vendor UFSDxe stays out (GenFfs log confirms it is not in the FV). Image builds/2026-10-29/boot-ossufs36.img (image daef53c60fec..., FD 4d65b9dd9a22..., kernel 732315ab..., probe 36), not yet hardware-tested.",
+]
+completion = ["Firmware image builds, enters UniXNU, publishes the framebuffer and preserves the documented memory reservations."]
+limits = [
+  "The SEC entry-argument HOB patch is local to the WSL Mu-Silicium checkout; the Windows copy is unpatched.",
+  "Hardware verification of the vendor-tree image is pending.",
+  "UFSDxe/TzDxe are not in the image; the prior UFSDxe attempt failed with DEVICE_ERROR because its TZ application needs the tz partition. Enabling both switches may require making that failure non-fatal or reusing the kebab firmware configuration.",
+  "The QR exporter is a menu plugin: every UFSDxe build fails before the menu, so the log cannot be opened. The control booted, so the logger is sound. The vendor UFSDxe/TZ path is closed on this firmware; the 8 Pro Mu-Silicium TZ/UFS handoff is the gap. The kebab 8T branch experiment/kebab-xnu-ramdisk is not on Project-Silicium's public origin and the kebab repo has no Binaries/kebab, so its working UFSDxe/TZ binaries are unavailable here. The USB CDC serial console is a separate kernel-side port and would not run before the kernel either.",
+]
+next_action = [
+  "User resumed with their own approach (2026-10-29); the tree was restored to the stock baseline first: vendor UFSDxe back to 38d0db94... (UFSDxe.efi.orig kept), default PcdDebugPrintErrorLevel, original APRIORI order (UFSDxe before TzDxe). Baseline image boot-ufsdxe-stock15.img (image 2d1818b6..., FD c741bbd2...). The diagnostic knowledge and tooling stay: full RE report ufsdxe-full-re.md, analyzer tools/ufsd-re-analyze.py, the sense-key/ASC/ASCQ readouts (key 2 NOT READY, ASC 0x04, ASCQ unknown), the exc-handler SerialPortWrite tail + FAULT line, and all one-instruction patch scripts under tools/.",
+  "Parallel RE fork (2026-10-29): Mu-Silicium-re (branch re-ufsdxe, fork point d4d1e3c), device repo UniXNU-instantnoodlep-re and out root unixnu-out-re are copies of the main trees; the fork carries the RE diagnostic patch on the vendor UFSDxe (0xdce4 logs (ASCQ<<8)|0xF instead of 0x28b, tool tools/patch-ufsdxe-ascq.py). The fork also tracks the vendor binaries in git (the Binaries gitlink pointed at a never-cloned submodule; replaced at f09d6ba with the stock UFSDxe, ASCQ probe at c52697b), so rolling the fork back to stock is just git reset --hard f09d6ba and new RE patches are ordinary commits. Its first image boot-ufsdxe-re-ascq15.img (image d4c32843..., FD 2b9f4c49...) is the flashing artifact of the fork; build it with unixnu build firmware / bootimg --device .../UniXNU-instantnoodlep-re --uefi .../Mu-Silicium-re --out .../unixnu-out-re. The main trees stay on the stock baseline for the user approach.",
+  "ASCQ readout on hardware (boot-ufsdxe-ascq15.img): 20F = ASCQ 0x02 initializing-command-required - after every link reset the device waits for fDeviceInit (Query UPIU SET FLAG, opcode 6, flag IDN 1 per the kernel ufs.h). The RE fork answered with boot-ufsdxe-re-nocold15.img (image 7db95131..., FD 79277b37..., UFSDxe 719f6621..., re-ufsdxe commit ec776e0): UfsHwInit is stripped of every link-disturbing step (HCE=0 store, CFG1 rewrite, PCS/PHY pokes 0x16c8c/0x1683c/0x16bbc, both register patch tables) so the XBL-established link and the ready device state survive into the vendor driver; the ASCQ probe stays at 0xdce4 for readout, and rollback to stock is git reset --hard f09d6ba.",
+  "BETA line + kernel probes 26-36 (2026-10-29): the firmware ships no vendor storage or TZ stack (STORAGE=0/TRUSTZONE=0, UFSDxe commented out of APRIORI.inc/DXE.inc, SmmuBypassDxe removed after it hung the board in APRIORI), and every kernel reconstruction of the vendor sequence has now been measured on hardware. Results: (a) with the firmware touching neither UFS nor SMMU the takeover still completes and the UTRLDBR store never retires (boot-beta-min15, row 1 = 3, row 2 = 1); (b) taking over the bootloader list is impossible because that heap was recycled by our own UEFI (dw0 = 0x7bfb); (c) stopping HCE without the full cold path leaves the whole register block reading zero (levels 27-29, 33, 35, 36); (d) the full coldStart plus DME_LINK_STARTUP gives cold 0 / link 0 / HCS.DP 1 and the doorbell still does not retire (levels 30-32, 34); (e) CFG1 bit 26, the vendor literal CFG1, the PCS and ICE-side pokes, UTMRLBA on the same page, low-4GiB DMA, cache maintenance, an empty UTRD and an SMMU bypass of streams 0x4E0/0xE0 all changed nothing. The vendor UFSDxe itself works in the same firmware (TUR answers CHECK CONDITION) and fails only on the device reply: sense key 2 / ASC 0x04 / ASCQ 0x02 = NOT READY, initializing command required. That state needs fDeviceInit (Query SET FLAG, opcode 6, IDN 1), which the vendor driver assumes XBL already sent. Next step is firmware-side: inject one Query SET FLAG into UFSDxe before its first TUR, using the working UTRL path and HALIOMMU domain. Full detail in NEXT-AGENT-HANDOFF.md and ufsdxe-full-re.md.",
+  "Firmware-side ask to GFander (2026-10-29 late): kebab-UEFI is public now (38 patches, 9999-worktree.patch and src/, but only the kebabPkg diff), so the request is three specific questions instead: (1) whether his Binaries/kebab UFSDxe/TzDxe already carries a fDeviceInit query (Query SET FLAG, opcode 6, IDN 1); (2) what initialises the UFS host and link inside his firmware; (3) the exact HALIOMMU domain attach parameters. Never flash the 8T FD on the 8 Pro.",
+]
+evidence = [
+  { kind = "source", reference = "board.toml", result = "Firmware inputs, FD path and payload geometry for instantnoodlep" },
+]
+
+[[area]]
+id = "cpu"
+status = "planned"
+components = []
+paths = ["package/CpuFreq*", "scripts/*armcpu*"]
+inputs = ["Identify the cpu and interrupts hardware, resources and existing component interfaces for this board."]
+configuration = ["Record the board.toml fields, DTS properties and defconfig values used for cpu and interrupts."]
+procedure = ["Follow the cpu and interrupts stage in the porting guide and record the actual commands."]
+findings = ["Collect the first cpu and interrupts observation, its cause when established, and the resulting implementation decision."]
+completion = ["Every enabled CPU reaches its entry checkpoint and timer/IPI handling works on each enabled CPU."]
+limits = ["Hardware inputs and implementation are pending for this example board."]
+next_action = ["Inventory the required cpu and interrupts inputs before implementation."]
+evidence = []
+
+[[area]]
+id = "memory"
+status = "implemented"
+components = []
+paths = ["dts/**", "package/*Smmu*", "package/*Memory*", "scripts/*smmu*", "scripts/*memory*"]
+inputs = [
+  "DRAM: memory@80000000 with reg = <0 0x80000000 0x2 0x0> (8 GiB). Source: dts/instantnoodlep.dts:8-12; board.toml payload.dram_size = 0x200000000.",
+  "Firmware map: the first 6 MiB are unavailable to UniXNU; DXE heap 0x98900000/0x3300000, Display Reserved 0x9C000000/0x2400000, UEFI FD 0x9FC00000/0x300000, Kernel 0xA0000000/0x100000000 and ramoops 0xB0000000/0x400000. Source: vendor uefiplat.cfg and MemoryMapLib.c.",
+  "Loader handoff: payload.adt.owned_memory_size = 0x100000000 (4 GiB) in board.toml:80; the ADT memory map must stay inside the firmware map.",
+  "UFS DMA: the kona ufshc node has no iommus property, so the controller uses physical addresses; the driver allocates 16 KiB physically contiguous cacheable memory and performs explicit dc civac/ivac. Source: sm8250.dtsi:56-66, NativeUfs.cpp:222-224, 1712-1744, 462-486.",
+  "SMMU: sCR0 = 0x002704d5 (USFCFG=1); the only valid SMR is display 0x820/mask 0x402; UFS has no SMR. The SMMU inventory is read-only.",
+]
+configuration = [
+  "board.toml: payload.dram_size = 0x200000000 (74), payload.adt.owned_memory_size = 0x100000000 (80), device_tree.source/include_dirs (34-36).",
+  "dts/instantnoodlep.dts: memory@80000000 and reserved-memory (8-25); sm8250.dtsi ufshc has no iommus (56-66).",
+]
+procedure = [
+  "./unixnu defconfig instantnoodlep_defconfig -D ../UniXNU-instantnoodlep; ./unixnu status --json -D ../UniXNU-instantnoodlep.",
+  "./unixnu payload ...; ./unixnu bootimg ...; compare uefiplat.cfg/MemoryMapLib.c with the ADT memory map.",
+]
+findings = [
+  "CPU addresses are kernel virtual addresses; UFS DMA uses physical addresses from getPhysicalSegment and the same lines are cleaned/invalidated on the CPU mapping.",
+  "The UFS request list is in the DXE heap and its base changes across boots (0x9a12b000/0x9a133000/0x9a156000/0x9a12f000 observed); it cannot be hard-coded.",
+  "The firmware display reservation is 0x02400000 bytes while the board DTS splash reservation is 0x2300000 bytes; this must be reconciled before the ADT is treated as complete.",
+  "UFS is not an apps-SMMU consumer; the SMMU wildcard experiments did not change the doorbell behavior and are not part of the critical path.",
+]
+completion = [
+  "The ADT memory map covers the 8 GiB DRAM window and does not overlap the firmware display/DXE/FD/Kernel reservations.",
+  "payload.dram_size equals the DTS memory node size; owned_memory_size is consistent with the loader contract.",
+  "Each enabled DMA engine can access its allocated range with the documented cache policy; UFS DMA is currently unproven.",
+]
+limits = [
+  "UFS DMA has not completed a command; the doorbell store does not retire even for an all-zero UTRD.",
+  "UFS SMMU/TBU/XPU ownership is not established; the kona DTS says the controller has no iommus, so the SMMU is not the expected translation path.",
+  "The splash reservation size differs between the board DTS (0x2300000) and the firmware map (0x02400000).",
+  "A persistent log region is not defined; it depends on a working storage path.",
+]
+next_action = [
+  "Reconcile the splash reservation size and record the firmware memory map in this area.",
+  "After the storage doorbell retires, verify the UFS DMA range and cache policy on hardware.",
+]
+evidence = [
+  { kind = "source", reference = "dts/instantnoodlep.dts", result = "8 GiB DRAM window and 0x2300000 splash reservation" },
+  { kind = "source", reference = "board.toml", result = "dram_size 0x200000000 and payload.adt.owned_memory_size 0x100000000" },
+  { kind = "source", reference = "drivers/Sm8250Ufs/NativeUfs.cpp", result = "Physically contiguous cacheable DMA with explicit clean/invalidate" },
+]
+
+[[area]]
+id = "storage"
+status = "implemented"
+components = []
+paths = ["drivers/Sm8250Ufs/**", "scripts/build-sm8250-ufs.py", "configs/instantnoodlep_defconfig", "dts/instantnoodlep.dts"]
+inputs = [
+  "Controller: qcom,sm8250-ufshc, qcom,ufshc compatible, host 0x01d84000/0x3000, ICE 0x01d90000/0x8000, GIC SPI 265 (interrupts stay out of the ADT until the driver uses them). Source: arch/arm64/boot/dts/vendor/qcom/kona.dtsi ufshc_mem.",
+  "PHY: qcom,sm8250-qmp-ufs-phy at 0x01d87000/0xe00, two lanes, 19.2 MHz reference; the vendor tree ships phy-qcom-ufs-qmp-v4.c, not mainline phy-qcom-qmp-ufs.c. Source: kona.dtsi ufsphy_mem, phy-qcom-ufs-qmp-v4.h.",
+  "Clocks: GCC at 0x00100000; nine UFS branches with their CBCR offsets (axi 0x77010, ahb 0x77018, tx_symbol_0 0x7701c, rx_symbol_0 0x77020, unipro_core 0x7705c, ice_core 0x77064, phy_aux 0x7709c, rx_symbol_1 0x770b8, aggre_ufs_phy_axi 0x770cc). Source: drivers/clk/qcom/gcc-kona.c.",
+  "Reset and power: GCC_UFS_PHY_BCR at 0x77000 bit 0; controller-side PHY soft reset is REG_UFS_CFG1 (host 0x0dc) bit 1; ufs_phy_gdsc at 0x177004 with SW_COLLAPSE bit 0 and PWR_ON bit 31. Source: kona.dtsi qcom,gdsc@177004, ufs-qcom.c ufs_qcom_power_up_sequence and ufs_qcom_full_reset.",
+  "DMA: no iommus property on the kona ufshc node, so DMA uses physical addresses; no apps-SMMU context or stream takeover is needed.",
+  "Handoff: measured on hardware. pre21 reads HCE=1, HCS=0x010f, CAP=0x1587031f, RSR=1, DBR=0, UTRLBA in the DXE heap, all nine CBCR enabled with no CLK_OFF, four RCG roots running (cmd ROOT_OFF=0), ICE ctrl=0/bypass=0x80000000, and UIC IS cleared. The XBL pre snapshot is IS=0x400 (UIC_COMMAND_COMPL) and its list base changes per boot. The vendor UEFI UFSDxe is not in this firmware because its trusted-zone application needs the tz partition.",
+  "Storage layout: capacity, LUN count and GPT are not read; no SCSI command has completed.",
+]
+configuration = [
+  "CONFIG_XNU_NATIVE_UFS=y in configs/instantnoodlep_defconfig; the archive build is scripts/build-sm8250-ufs.py, which produces build/sheng-ufs/libShengUfs.a for the existing CONFIG_XNU_NATIVE_UFS link path.",
+  "board.toml [kernel] archives runs build-sm8250-ufs.py; kernel_args carry native-ufs-probe=25 (21 pre-ring dashboard, 22 empty UTRD, 23 HIBER_EXIT then TUR, 24 HIBER_EXIT plus UIC error codes, 25 full cold start then TUR) and native-ufs-probe-delay.",
+  "sm8250.dtsi enables ufshc and ufsphy with unixnu,adt-name; interrupts stay commented out because a specifier here panicked in IODTGetICellCounts.",
+  "The driver keeps the runtime class NativeUfs so the KernelConfigTables personality applies; hardware work runs from the root-device personality in a delayed kernel thread.",
+]
+procedure = [
+  "Record controller, PHY, clock, reset, power, DMA and handoff state before programming anything (docs/porting/ufs.md step 1).",
+  "Two initialization paths exist: a full cold start (GDSC, nine branches, BCR pulse, REG_UFS_CFG1 PHY reset, QMP v4 tables, SerDes start, PCS poll) for level 2, and a firmware-state takeover (stop both lists, program a physically contiguous request list, start UTRL) for levels 15 and above. The kebab path does not run the cold start; QUNIPRO select is written but this firmware ignores it.",
+  "Build the archive with scripts/build-sm8250-ufs.py and link the kernel with CONFIG_XNU_NATIVE_UFS=y.",
+  "Verify milestones in order: register access, empty-list doorbell retirement, command completion, known-block reads, root mount, persistence. Do not expect a post-ring panic: the stall takes the display path within tens of milliseconds.",
+]
+findings = [
+  "ShengUfs is a warm-boot takeover: it has no clock enable, PHY initialization, link start or power sequence, and its build hard-requires the VerifiedRoot closure, so it cannot be selected unchanged for this board.",
+  "The qcom gdsc driver clears SW_COLLAPSE (bit 0) and waits for PWR_ON (bit 31); 0x177004 is exactly GCC_BASE + 0x77004, the same offset SM8550 uses for its GDSCR.",
+  "Branches with hwcg_bit=1 report CLK_OFF while idle, so CLK_OFF must not be read as a failed enable. pre21 measured all nine CBCR enabled with bit31=0.",
+  "The PHY tables must be written between UFS_PHY_SW_RESET assert and deassert, and the controller-side PHY soft reset wraps the whole sequence as in ufs_qcom_power_up_sequence.",
+  "0x770cc is rx_symbol_1 on SM8550 but aggre_ufs_phy_axi on kona; copying the old header would silently clock the wrong branch.",
+  "The UTRLDBR=1 store does not retire with the kebab takeover. ring17-20 changed clk_req, the SMMU wildcard, the 4 GiB low allocation and the helper-thread ring independently; all four images showed the same second-row-1 store stall, so those four variables are excluded.",
+  "empty22 rang an all-zero UTRD (no valid command) and the store still did not retire: descriptor content, UCD/PRDT and the fetch path are not required for the stall.",
+  "The pre21 pre IS 0x400 is UIC_COMMAND_COMPL, not a UTP error; the XBL left the last UIC command completed. hiber23 sends DME_HIBER_EXIT (0x18) but the following TUR store still does not retire.",
+  "The only valid SMR is the display stream 0x820; UFS has no SMR and sCR0.USFCFG=1. The SMMU wildcard did not fix the stall and is not on the critical path.",
+  "uic24 sent DME_HIBER_EXIT and read the five UIC error-code registers: hib=1, DME=0x80000001 (Err bit31, Ec bit0), PA/DL/NL/TL=0, HCS=0x10f. The DME layer rejects HIBER_EXIT; the link is up, so the H8 hypothesis is not supported and cannot be tested by this command.",
+  "full25 ran the complete kernel cold start (HCE off, GDSC/branches/BCR/CFG1 PHY reset, QMP tables, PCS, QUNIPRO), HCE on, DME_LINK_STARTUP and HCS.DP. The cold-start, link and DP blocks were all green, but the TUR doorbell store still did not retire. The kernel-side init is therefore not the missing piece.",
+]
+completion = [
+  "Host: registers readable and the measured clock/PHY/link values recorded (docs/porting/ufs.md milestone 1).",
+  "DMA and commands: the doorbell store must retire for an empty list and for a bounded command, which must complete with a checked OCS and SCSI status (milestone 2).",
+  "Block reads: capacity and known blocks match the selected LUN and 4096-byte logical block size (milestone 3).",
+  "Root: GPT and root windows bounded; the configured root mounts and starts userland (milestone 4). Persistence: writes survive the documented reboot/reset sequence (milestone 5).",
+]
+limits = [
+  "Registers have been read on hardware, but no SCSI command has completed and the UTRLDBR store does not retire; capacity/LUN/GPT/root are unread.",
+  "The kebab path does not run the full cold start; the PHY/BCR/HCE combination has not been tested with a doorbell.",
+  "HIBER_EXIT returns 1 with a DME-layer UIC error (0x80000001) while PA/DL/NL/TL are 0; the DME rejects the command, so H8 is not supported. The full PHY/BCR/HCE/link cold start is green but the doorbell store still does not retire.",
+  "The probe panics by design and does not publish a block device or root; post-ring panic output is not available in this stall.",
+]
+next_action = [
+  "Make the HIBER_EXIT result visible before the ring (level 23b), then test the empty-list store after a confirmed wake.",
+  "Test the firmware handoff: build instantnoodlepPkg with INSTANTNOODLEP_STORAGE=1 and INSTANTNOODLEP_TRUSTZONE=1 so the vendor UFSDxe/TzDxe are present, then compare the doorbell store. If UFSDxe fails on the TZ application, make the failure non-fatal after the host/domain init or reuse the kebab firmware configuration.",
+]
+evidence = [
+  { kind = "source", reference = "drivers/Sm8250Ufs/Sm8250Facts.h", result = "Windows, GDSC, nine CBCR offsets, BCR, host registers, UIC opcodes and the two QMP v4 tables, each cited to the vendor tree" },
+  { kind = "source", reference = "drivers/Sm8250Ufs/NativeUfs.cpp", result = "Cold start, kebab takeover, empty-slot ring, pre-ring dashboard, DME_HIBER_EXIT and the RAM-only ring report" },
+  { kind = "source", reference = "scripts/build-sm8250-ufs.py", result = "Replays the XNU compile record and produces build/sheng-ufs/libShengUfs.a without the VerifiedRoot closure" },
+]
+
+[[area]]
+id = "display"
+status = "implemented"
+components = ["GopFramebuffer"]
+paths = ["package/*Display*", "package/*Framebuffer*", "package/*Backlight*", "package/AppleARMBacklight.cpp", "package/GeniI2c*", "scripts/*display*", "scripts/*gop*", "scripts/*framebuffer*"]
+inputs = ["21H461 MobileFramebuffer/IOSurface ABI remains pinned and qualified by the display archive recipe.", "Factory DTB: Samsung AMS678UW01 command-mode panel, DSI0 0x0ae94000, GPIO112 Iris bypass indication, brightness 0..2047.", "ColorOS dsi_ctrl_hw_cmn.c FIFO and BTA flow; DCS brightness bytes follow dsi_iris5_pq.c and drm_mipi_dsi.c.", "UniXNU-sheng 516a780473a2ac59c8b438e132bb60204dda9e22 AppleARMBacklight OS interface and coalesced request handling."]
+configuration = ["Complete components.include retains existing entries and adds GopFramebuffer. The board adds scripts/build-sm8250-display.py; CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y, mobile display remains n. Actual linked marker is0:1.", "Late initialization runs after IOKitBSDInit, loads original families and uses a real IOPlatformDevice framebuffer memory range. No fabricated Apple compatible or MMIO range.", "R20 payload adds smgop=1, offline-legacy-gop/register/pm/validate/transfer/retire/cpu-present=1, offline-legacy-phase=4 and sheng-vsync=60. This timer is software pacing, not measured panel refresh."]
+procedure = ["python3 analysis/display-r20/run_build.py defconfig instantnoodlep_defconfig", "python3 analysis/display-r20/run_build.py build kernel (wrapper supplies --local-module driver:GopFramebuffer=analysis/display-r20/reference/gop, an exact archive of catalog revision cf3b429)", "python3 analysis/display-r20/audit_linked_atoms.py; python3 apply_h4c_policy.py; python3 build_h4c_image.py"]
+findings = ["R19 did not select or link a display backend. It ran16743s before backboardd stopped checking in; OBJC/code1 alone does not prove a display cause.", "R20 native kernel compiled and final function atoms, resolved calls, all358 derived vtable entries and unique late IOBSD caller passed static checks. The linker places the noreturn guard in a cold section; a whole-object linear-layout comparison was rejected and replaced by per-function checks.", "CPU request bounds test passed ASAN/UBSAN after rejecting the bad-stride mutation. Neither this test nor a successful build proves a known frame appears on hardware."]
+completion = ["A known frame appears with correct geometry and colors, then userland presentation and backlight controls work."]
+limits = ["CPU GOP presentation, roughly 60 Hz interface timing, and DSI0 399->299->399 write/read/restore are qualified by the recorded captures.", "CoreBrightness discovery and Control Center brightness passed: user confirmed, 193 requests/readbacks matched across levels 1..2047 in unixnu-serial-20261112-114329-45068.log.", "Brightness0..2047 and two screen-off/wake cycles passed with user confirmation and matching readbacks. User also confirmed normal fades and closed fade testing; captured requests have FadePeriod0. Known-frame color/geometry patterns remain unverified. GPU rendering is tracked separately.", "The DSI backend serializes its own transfers and checks firmware scanout idle, clocks and Iris bypass before submitting."]
+next_action = ["Retain h4c-backlight-service as the verified Control Center brightness baseline.", "Retain backlight-service as the accepted brightness baseline. Fade appearance is accepted from user observation."]
+evidence = [
+ { kind = "source", reference = "package/SmGopDisplay.cpp", result = "CPU GOP presentation and late In2020Backlight initialization" },
+ { kind = "source", reference = "package/In2020BacklightService.h", result = "AppleARMBacklight conformance, iPadOS 17 brightness parameters, coalesced asynchronous fades" },
+ { kind = "source", reference = "package/In2020BacklightTransport.h", result = "Qualified DSI0 FIFO brightness transport, readback and bounded idle/completion waits" },
+ { kind = "hardware", reference = "analysis/usb-cdc/unixnu-serial-20261112-111747-129760.log", result = "Trial 399->299 verified1 and restore399 verified1; subsequent GOP retirement" },
+ { kind = "hardware", reference = "analysis/usb-cdc/unixnu-serial-20261112-114329-45068.log", result = "AppleARMBacklight published; 193 applied/readback matches, levels1..2047; user confirmed visible brightness control" },
+ { kind = "hardware", reference = "analysis/usb-cdc/unixnu-serial-20261112-115715-61592.log", result = "244 additional readback matches, levels0..2047; two 814->0->814 off/wake cycles; user confirmed all normal" },
+ { kind = "verification", command = "python3 analysis/display-r20/audit_linked_atoms.py", reference = "analysis/display-r20/linked-checks.json", result = "Final native function atoms,358 vtable entries and unique late initialization caller passed; hardware unqualified" },
+ { kind = "verification", command = "python3 analysis/display-r20/test_display.py", reference = "analysis/display-r20/copy-bounds-tests.json", result = "Bad-stride mutant rejected, candidate passed ASAN/UBSAN; no physical presentation claim" },
+]
+
+[[area]]
+id = "input"
+status = "implemented"
+components = []
+paths = ["patches/xnu/sm8250-alert-slider-ringer.patch", "patches/xnu/sm8250-alert-slider-position.patch", "patches/xnu/sm8250-alert-slider-samples.patch", "patches/xnu/sm8250-alert-slider-range-id.patch", "patches/xnu/sm8250-alert-slider-enable-id.patch", "patches/xnu/sm8250-alert-slider-poll-id.patch", "patches/xnu/sm8250-alert-slider-power-id.patch", "patches/xnu/sm8250-alert-slider-id.patch", "patches/xnu/sm8250-touch-probe-r38.patch", "patches/xnu/sm8250-touch-power-r39.patch", "patches/xnu/sm8250-touch-cmddb-r40.patch", "patches/xnu/sm8250-touch-rails-r41.patch", "patches/xnu/sm8250-touch-events-r42.patch", "patches/xnu/sm8250-touch-hid-r43.patch", "package/Sm8250TouchHid.cpp", "scripts/build-sm8250-touch-hid.py", "patches/xnu/sm8250-physical-keys-r46.patch", "patches/xnu/sm8250-p6-gpio7-pull.patch"]
+inputs = ["IN2020 stock DTB places S6SY791 at SE13 I2C 0x48, with GPIO36/37 bus pins, GPIO38 reset and GPIO39 interrupt.", "The stock rails are ldoc1 at 1,800,000 microvolts and ldoa13 at 3,008,000 microvolts."]
+configuration = ["R42 diagnostic mode uses sm8250-touch-probe=3. R44 publication uses sm8250-touch-probe=4 and sheng-touch-hid=1. Normal boot leaves these unset."]
+procedure = ["Compare the SM8250 clock/DFS state, vote S5 and initialize the idle I2C engine. Hold reset low, check both LDO identities and voltage settings, then use the GF RPMh sender for the stock digital-first rail order. Release reset and read boot/integrity through the existing UniXNU GENI probe."]
+findings = ["R41 qualified the physical rails and chip reads. R42 captured one physical down, move and up. R43 pure digitizer did not match the original event driver. R44 used the ShengHidInput composite descriptor, matched IOHIDEventDriver and passed the physical single-contact report lifecycle with handleReport returning success.", "2026-11-12 source inventory: factory i2c@984000 lists MXM1120 down/up at 0x0c/0x0d and IST8801 down/up at 0x18/0x19, with GPIO158/157 IRQs and ldoc10 supply. The listed alternatives do not identify the installed part. Hall coordination is in the supplied kernel oplus_tri_key.c, not the separate mechanical tri_state_key.c implementation.", "The opt-in sm8250-slider-probe=1 discovery patch runs once before the key worker acquires SPMI; it qualifies ldoc10 enable/voltage, GPIO4/5, GCC wrap0 S1 and firmware I2C state before reading DID register 0x09 at the four factory addresses. It restores idle controller configuration and releases its own clock vote. This is identification only; three-state classification and ringer integration are pending device evidence.", "Alert-slider identity candidate compiled and packaged as boot-instantnoodlep-alert-slider-id.img, SHA256 5b4e5e7b20772cfab723752d82351df38b28ac6b32840fbf599f61445254e904. Final source matches the compiled XNU tree, key-worker import resolves to the executable linked probe, and payload comparison changes only kernel.macho and the opt-in argument. Device identification remains unverified.", "The 20261112-123751 capture lines340-344 show missing wrap0 slave-AHB vote, GPIO4/5 still GPIO inputs, and L10 type4/subtype7d at3312mV disabled. The next board patch votes the factory clock bits and input mux, binds only ldoc10 from the uniquely named firmware VREG command-DB entry, requests3008mV and verifies it before enable. Both candidate sensor voltage ranges contain3008mV. No sensor configuration or ringer-state writes are included.", "The power-ID candidate passed the focused before/after command-policy check and the full kernel build. Packaged image SHA256 2e01f0a2107987b15204052dbc38702a0590b3c31d7d5c835c3575142777a42a changes only kernel.macho from the first ID image, retains the existing opt-in argument and3GiB seed, and has no device identification result yet.", "The 20261112-132444 capture lines342-345 confirms wrap0 votes and S1 clock enabled, I2C firmware303 and idle state0, with engine output IRQ gate0xf. The former master-IRQ-enable rejection stopped the probe before the power helper. The polling candidate accepts only the observed idle default0xf or masked0, still qualifies GSI/DMA/FIFOs and active-state bits, masks the four engine output gates with readback, then restores the saved gate on idle exit. The existing clock, power and DID policies are retained.", "Idle GENI polling handoff candidate passed full build and packaging, image SHA256 18108555e39f865dd95a8e8b5dc0b8cf69844df9043bf52185b4d7f0ccd496b7. Generated source matches the candidate and only payload kernel.macho differs from power-ID. Await actual masked-output, L10 and DID results before claiming slider identification.", "The 20261112-134127 capture lines344-350 confirms masked IRQ handoff and firmware ldoc10 address41500, with acknowledged3008mV request but disabled PMIC VSET still3312mV. The prior extra pre-enable physical-readback condition prevented the enable request. This candidate follows vendor qcom-rpmh-regulator.c set_enable_state: acknowledged voltage request, then enable, followed by bounded actual PMIC enable/voltage readback. Device cause of the stale pre-enable VSET remains unresolved; no identification is accepted without final enable80 and3008mV.", "Vendor voltage-vote then enable candidate built and packaged, image SHA256 dc2c55e8a60dfd7c135bb263db86fc4cbc21e1249a840b42fffd1b7ae3ac02c1. Final source matches generated XNU and only payload kernel.macho differs from poll-ID. Disabled rails always establish a3008mV vote before enable. Actual enabled PMIC state and sensor identity remain unverified.", "The 20261112-141931 capture lines343-352 confirms both RPMh voltage and enable commands completed, and observed PMIC enable changed0->80 while VSET remained3312mV. No DID transaction occurred because the old exact3008mV acceptance failed. The iSentek IST8801 product page specifies1800..3600mV, the supplied MXM1120 driver specifies2700..3600mV, and the factory board L10 interval is3000..3312mV. This candidate requires actual enable80 and that narrower shared interval, reports requested versus observed voltage separately, and does not claim exact3008mV control or a proved aggregation cause. The existing3008mV command encoder is unchanged.", "Source-backed3000..3312mV Hall-ID candidate passed full build/package, image SHA256 01da13c08326fdad31d4ab3441bc8c1a8403ec1717a639a329b6cd5a93f2baaf. Final source matches generated XNU and only payload kernel.macho changes. Exact voltage control and actual sensor identity remain unverified; in-range supply acceptance is not a3008mV regulation claim.", "The 20261112-182928 capture lines353-359 identifies a full IST8801 pair at18/19, each DID81, with idle/restored GENI and restored IRQ output. The sample candidate uses the supplied IST8801 reset_device and20Hz measurement register profile, with the documented polling bit instead of threshold IRQ mode. Mode2 transfers controller ownership to nonblocking polling from the existing16ms key worker; mode1 retains ID-only behavior. It records signed up/down values and ST1 validity at most once per second after the first8 pairs for up to30minutes, with bounded asynchronous timeouts. Three-state thresholds, calibration and iPadOS ringer mapping remain unimplemented and require labelled physical positions.", "IST8801 raw-sample candidate passed full build/package, image SHA256 e772b81bfcd01bad18628307bca6170a461dfa4793da3d3bd92769cb84f46e76. Both final C sources match generated XNU, key-worker poll/stop imports resolve, and payload changes only kernel.macho plus mode1->2. Await labelled top/middle/bottom raw values, sensor-init readbacks and confirmation that physical keys remain responsive. No calibrated position or ringer behavior is claimed.", "The 20261112-185615 capture SHA256 65b1d9aa73dd890d7fd553129cf088bf76d76f1123b0dd3758e05304c34acdb5 initializes both IST8801 parts and reaches3120 pairs over417.7 seconds, with397 printed pairs all status15/15 valid. User confirmed top boot and middle/bottom/middle/top movement. Observed difference groups are around-232, near0 and+223. Mode3 adds handset-calibrated bounded difference windows and factory sum tolerance40, plus board policy of3 consecutive valid pairs spanning200ms with500ms maximum gap. It logs initial and changed physical position only, leaving modes1/2 unchanged. Standalone checks cover bad status, magnetic offset, deadband, debounce, boot positions and direct moves. Classification remains pending device validation; no system ringer or haptic event is connected. Capture still ends at30minutes and is not a production slider service.", "Mode3 recognition candidate fully rebuilt and packaged as alert-slider-ist-position, SHA256 494375acae25f73598dad6c406cc7c0d373d51e03f870816036fab64c2fb65bd. Native and delivered source hashes match; only kernel and mode2-to3 config differ from the device-tested raw sampler. Position changes are logged with ringer=unbound; recognition remains pending a labelled device run and input area is not promoted to fully verified.", "Capture20261112-191555 SHA256 578029380948ed8ebcfc4047393ae9de6633c83f850197fa6653adb8124ead65 device-verifies initial up and exactly up/middle/down/middle/up with835.539seconds of no repeated position events. Last pair6288 at849.152seconds; no slider timeout/failure or kernel panic observed. This supersedes pending mode3 recognition for this tested sequence only. All events retain ringer=unbound; physical classification is distinct from system ringer and haptic integration. Alternate boot positions, direct end-to-end moves and capture expiry remain unverified.", "Mode4 connects the device-verified physical slider to a dedicated original-ABI In2020RingerService. The pinned21H461 backboardd compares page11 usage46, stores down0=silent/down1=tone1, and queries initial state with matching type3. The service implements query plus state-change dispatch, waits for a confirmed position before publication, maps upper and middle to silent and lower to ring, and never invents a vibration event. It shares the existing controlled IOHIDEventService class-registration and binding recipe; both219-slot vtables and exact type3 keyboard layout are audited. Sampling stays in the existing key worker, mode4 removes30min expiry, and transport loss invalidates source without a guessed system toggle. System behavior remains pending device acceptance.", "Ringer integration fully rebuilt and delivered as alert-slider-ringer SHA256 21fda6fe1027d5e4deae0489aa5221ec9f707c3be7a485b38a54fb7a75f7890c. Both219-slot HID vtables and keyboard32-byte layout pass the pinned original ABI audit; native class and atomic position getter link. Only kernel and mode3-to4 config changed. Upper/middle=silent, lower=ring; initial query and change dispatch are implemented. Device/native-client/UI acceptance remains false; haptic/vibrate policy and automatic transport recovery remain open.", "Capture20261112-212957 SHA256 5e8bc13fa2531d6f977ce7e1837f0f859754f7f8dc2722a01ff2965840b703d5 device-verifies mode4 service start, initial matching type3 query answered1 atline783, native event conversion/getter checks and state dispatch0/1/0/1/0 atlines531/984/986/1019/1025. Middle causes no duplicate binary event; direct end-to-end source changes also appear. No slider/ringer failure or kernel panic observed. User did not watch the mute indicator; UI and audible acceptance remain unverified, haptics unimplemented. Current image suffices for indicator observation; no new ID/raw/position diagnostics are needed.", "The214713 capture SHA will be recorded with user UI-failure evidence: repeated native query/dispatch did not change the mute icon. Original keyboard factory code proves manual event defects: options must include absolute1, pressCount is data byte28 and data word24 contains longPress/clickSpeed. The old encoder put1 atword24, left pressCount0 and absolute0. The candidate removes manual event serialization entirely and binds the pinned original IOHIDEvent::keyboardEvent entry plus the original slot31 sender setter. Initial query, source state policy, Hall sampling, identity, ADT and Data remain unchanged. Fixing this proven defect does not yet prove it was the sole cause; native UI acceptance still requires device observation.", "User UI-failed214713 log SHA256 8eff0ddfe2dbe8921831f49430d7d40442301cd878d3ce571d7682030eb2d4b8 disproves full acceptance of the previous ringer image. Original21H461 factory proves manual event count/longPress/absolute-option defects. New alert-slider-native-ringer candidate SHA256 5a4acee3ae14a66330457211dce2d059d8506164e5bc1a95a81f529b07259df6 calls the pinned original keyboard factory and original sender setter; actual linked factory VA4afb5b0 and both219-slot ABI audits pass. Only kernel.macho changes; ADT/config/identity/Data remain identical. This fixes a proven implementation defect but sole-cause and UI acceptance remain unproven. Haptics remain unfinished."]
+completion = ["Read application mode and integrity on the physical chip, then verify display coordinates, stable contact IDs, releases and simultaneous touch."]
+limits = ["Raw coordinate maxima 1439 and 3168 come from the stock IN2020 DTB. R44 validated portrait GOP geometry at 1080 by 2376 and a complete physical HID lifecycle. 21H461 edge events and swipe into the desktop were verified. Full multitouch and audible volume changes remain separate checks.", "The physical three-position alert slider is not implemented: current KEY46 reads only PM8150 PON and GPIO6/7. The factory tree lists alternative MXM1120 and IST8801 Hall pairs, so the populated pair and calibration remain unmeasured. Haptic feedback also requires a working vibrator driver."]
+next_action = ["Implement the IN2020 Hall alert slider: qualify GENI I2C 0x984000 and ldoc10 ownership, identify the actual MXM1120 or IST8801 pair by DID, then capture all three positions before binding a verified iPadOS ringer-state interface.", "Verify audible volume changes after the audio output route is brought up."]
+evidence = [
+  { kind = "source", reference = "patches/xnu/sm8250-p6-gpio7-pull.patch", result = "Restores the factory GPIO7 pull-up only on a matched PM8150 input with AP-owned SPMI writes." },
+  { kind = "hardware", reference = "unixnu-serial-20261111-033002-81468.log:325-332,1437-1453", result = "Edge handling installed, GPIO7 pull-up read back, and both volume keys and power delivered press/release reports." },
+  { kind = "source", reference = "patches/xnu/sm8250-touch-power-r39.patch", result = "R39 verifies the two stock LDOs before enabling them and retains the R38 sensor probe." },
+  { kind = "source", reference = "https://github.com/GFander/UniXNU-kebab/blob/d5c9c62db752f225a288b88959d3754edc94138a/docs/standardization-run-20261029/device/0202-touch-clock.log", result = "GF measured SE13 clock voting and the firmware-selected DFS state on SM8250." },
+]
+
+
+[[area]]
+id = "gpu"
+status = "implemented"
+components = ["ArmSmmu4K", "AdrenoFirmware", "AdrenoPM4"]
+paths = ["package/GpuPowerBoard.h", "package/Sm8250GpuReadOnly.h", "package/Sm8250GpuCx.h", "package/SmGopDisplay.cpp", "package/Sm8250AliothGmu.h", "package/Sm8250AliothCold.cpp", "package/Sm8250AliothCp.cpp", "package/Sm8250AliothCpTables.h", "package/Sm8250AliothZap.cpp", "package/Sm8250AliothPublish.cpp", "package/Sm8250AliothMetal.cpp", "package/adreno650-release-cpu-mapping.patch", "package/ioaccelerator-base-abi.json", "patches/xnu/sm8250-metal-addon-r59.patch", "patches/xnu/sm8250-metal-compact-r60.patch", "package/a650/A650Gmu.c", "scripts/build-sm8250-a650.py"]
+inputs = ["The stock IN2020 DTB identifies A650 chip 0x06050002 with GCC 0x100000, GPUCC 0x3d90000, GPU SMMU 0x3da0000, GMU 0x3d6a000 and GPU 0x3d00000.", "The R48 diagnostic uses the alioth GpuPowerBoard.h at aad6aebbdc2a5af26b8fbbe58bf19a26be28d6c3 under BSD-2-Clause-Patent."]
+configuration = ["R48 opts into fixed mode 1 with sm8250-gpu-ro=1 and smgop=1. The probe maps each window with VM_PROT_READ only once the upstream prerequisite checks permit access.", "R49 enables the temporary GPUCC mode-3 check with sm8250-gpu-cx=1. It restores modified bits after sampling.", "R50 uses sm8250-gpu-cx=2 and reads only GPU SMMU IDR0/1/2 after fresh CX and all required clock checks.", "R51 uses sm8250-gpu-cx=3 to read the board AOP command database and the current GMU clock configuration after SMMU verification."]
+procedure = ["R59 selects sm8250-gpu-alioth=12. Stage the signed iOS 17 plugin and Turnip alongside the five R47 wallpaper records. Add the two signed binaries to an owner trust module. Mount the Extensions view before registering the 21H461 IOAcceleratorES subclass."]
+findings = ["On IN2020, GCC and GPUCC were readable. CX and GX both read 0x00222001, and the SMMU vote clock read 0x80000000. The probe skipped SMMU and GPU reads, completed with io=0 and issued zero register writes.", "R49 brought GPU CX out of collapse, and GPUCC AHB and the SMMU vote clock read 0x00000001. Both touched bits were restored, with io=0 and writes=5/restored=5 as bitmasks.", "R50 re-sampled the GCC branches after CX power-up. MemNoC changed from 0x80004221 to 0x00004221 and SNOC DVM from 0x80000001 to 0x00000001. The GPU SMMU returned IDR0/1/2 0x4c017e06/0x20000005/0x00005511.", "The stock driver requires MIN_SVS (48) at 200 MHz. R51 read cx.lvl at 0x30000 and the first matching firmware ARC level 64 at index 2. The GMU source root and branch reported off.", "Persistent Data GPU addon gate repair: RAM capture 20261111-012320-33196 has WALL47 stage5 files11 and Preferences Metal fence182 completion. Current 20261112-221649-97620 has WALL47 stage1 EAUTH before install: fresh-data gate requires backend0. Use existing verified mounted-data readiness (persistent backend2/3 requires explicit no-passcode policy), retaining PID1, addon size/hash, original resource hash and read-only bindfs checks. Existing preferences remain O_EXCL; no Data reset or plugin replacement. Readiness harness rejects old gate and passes 120 cases. Persistent Metal runtime acceptance pending.", "Capture 20261112-224544-19080 SHA256 c94f1664e7237693d7897b3084ed1ac71a6bac4eff1481d9e0d2f6dc70996044 verifies backend2 volatile0, GPU59 registration, eleven addon files and backboardd/Poster GPU fence completion on image2316d4ee. User confirms Settings opens normally, but reports poor responsiveness and tearing. Current actual configuration has no sheng-fb-gpu; final scanout is CPU copy to active GOP with software60Hz cadence, not physical vblank. gpu-present-ownerdata-r1 SHA256 493568fd555fda131014d45d023346cc4e867cec10d04ef78842c688266a4965 only appends sheng-fb-gpu=1 sheng-early-retire=1 to actual FAT args. Native/embedded kernel, signed addon, trust, Data seed, ADT and boot chain stay byte-identical to the Settings-accepted parent. Historical early-retire0 stalled first swap; early-retire1 completed GPU copies but had single-core-era long waits. Current eight-core persistent test awaits user. No tearing fix or performance acceptance claimed.", "User2026-11-13 confirms gpu-present-ownerdata-r1 image493568fd: tearing gone and stutter clearly improved. Capture20261112-234127-48576 SHA2560eec6be0164b3b1baff5bfd102cdb4b5581281f88e2acb99bfeb5dd6a8dd1473: presenter ready line313, persistent backend2 volatile0 lines476-477, addon files11 written0 line481, GPU completed1-8 lines1598-1786. Preserve this user-confirmed improved baseline. Stability remains incomplete: backboardd pid56 watchdog SIGKILL line754 then replacement pid156;745 verify_swap rejection lines and variable early client timings. Do not infer physical vblank/pageflip or stable60FPS. Device-result.json separates user acceptance from runtime anomalies and prior host-only checks."]
+completion = ["GPU submissions complete, mapping and fence handling are correct, a known image renders, and the selected Metal client presents it."]
+limits = ["R48 verifies mode 1 on the board. R49 verifies GPU CX and the GPUCC clocks. R49 used a pre-CX snapshot for GCC. R50 verifies both GCC branches and GPU SMMU ID reads after power-up. The command database describes supported levels rather than the active CX vote. R53 verifies GMU clocks at 200 MHz. R54 verifies two GMU SMMU routes, firmware and HFI startup. R55 verifies GX power at 525 MHz and an accessible RBBM_STATUS. R56 completes the first kernel command and fence. R57 authenticates OnePlus ZAP, exits secure mode, and verifies the CP_NOP fence interrupt. R58 publishes NativeAdrenoGpu and completes one in-kernel IOUserClient submission and close. Userspace Metal and wallpaper presentation remain unverified."]
+next_action = ["Preserve GPU-copy R1 as the user-confirmed improved baseline. Further GPU work should diagnose swap validation, initial backboardd watchdog and frame tail latency without reverting persistent Data or the successful display mode. No Wi-Fi transition inferred."]
+evidence = [
+  { kind = "source", reference = "package/Sm8250AliothMetal.cpp", result = "R59 registers the alioth Metal accelerator after the addon mount. Presentation continues through CPU GOP." },
+  { kind = "host", reference = "https://github.com/ye3912/apfs/actions/runs/42555713273", revision = "100352506ebd79397d3d054e001d3f69e3974cc7", command = "python3 scripts/build-adreno-metal-plugin.py", result = "The macOS runner built and 4K-signed the iOS 17 plugin and Turnip. The IN2020 R59 image was packaged locally at 100155392 bytes." },
+  { kind = "source", reference = "https://github.com/FFT-infra/UniXNU-alioth/blob/aad6aebbdc2a5af26b8fbbe58bf19a26be28d6c3/package/GpuPowerBoard.h", result = "Unmodified staged prerequisite and register sequence." },
+  { kind = "device", reference = "analysis/desktop-r48/hardware/console.bin", result = "GPU48 mode1 complete gcc=1 cc=1 smmu=2 gpu=2 io=0 writes=0." },
+  { kind = "device", reference = "analysis/desktop-r49/hardware/console.bin", result = "GPU49 mode3 complete gcc=1 cc=1 cx=1 clocks=1 io=0 writes=5 restored=5." },
+  { kind = "device", reference = "analysis/desktop-r50/hardware/console.bin", result = "GPU SMMU IDR0/1/2 readable, stage=5 restored=5/5." },
+  { kind = "device", reference = "analysis/desktop-r51/hardware/console.bin", result = "cx.lvl 0x30000, MIN_SVS 48 maps to level 64 at index 2, GMU clock baseline sampled." },
+  { kind = "device", reference = "analysis/desktop-r54/hardware/console.bin", result = "GMU mode 7 completed: routes 2, firmware 20010008, 16 blocks, HFI ack c6, error 0." },
+  { kind = "device", reference = "analysis/desktop-r55/hardware/console.bin", result = "GX mode 8 completed at 525 MHz: vote 0, OOB ack on poll 2, GDSCR f8222800, RBBM 1." },
+  { kind = "device", reference = "analysis/desktop-r56/hardware/console.bin", result = "Four GPU routes, fence 2, CP_MEM_WRITE marker a6500c0d, RPTR=WPTR=1b, fault=0." },
+  { kind = "device", reference = "analysis/desktop-r57/hardware/console.bin", result = "Signed ZAP authenticated; secure exit fenced; SPI 300/INTID 332 rose once for CP_NOP fence 4." },
+  { kind = "device", reference = "analysis/desktop-r58/hardware/console.bin", result = "NativeAdrenoGpu published; client IB fence 5, marker 0badc0de, close 0." },
+]
+
+[[area]]
+id = "network"
+status = "planned"
+components = []
+paths = ["drivers/Ath12kWifi", "package/*Wifi*", "package/MhiBoot*", "scripts/*wifi*", "scripts/*mhi*"]
+inputs = ["Identify the network hardware, resources and existing component interfaces for this board."]
+configuration = ["Record the board.toml fields, DTS properties and defconfig values used for network."]
+procedure = ["Follow the network stage in the porting guide and record the actual commands."]
+findings = ["Collect the first network observation, its cause when established, and the resulting implementation decision."]
+completion = ["Scanning, association, address configuration and sustained receive/transmit traffic pass with the selected firmware."]
+limits = ["Hardware inputs and implementation are pending for this example board."]
+next_action = ["Inventory the required network inputs before implementation."]
+evidence = []
+
+[[area]]
+id = "audio"
+status = "planned"
+components = []
+paths = ["package/*Adsp*", "package/*Audio*", "package/*Gpr*", "package/QcomGlink*", "package/QcomMdt*", "package/QcomSmem*", "package/QcomSmp2p*", "scripts/*adsp*", "scripts/*audio*", "scripts/*gpr*"]
+inputs = ["Identify the audio hardware, resources and existing component interfaces for this board."]
+configuration = ["Record the board.toml fields, DTS properties and defconfig values used for audio."]
+procedure = ["Follow the audio stage in the porting guide and record the actual commands."]
+findings = ["Collect the first audio observation, its cause when established, and the resulting implementation decision."]
+completion = ["Each declared route carries the selected audio format through playback or capture and handles start/stop correctly."]
+limits = ["Hardware inputs and implementation are pending for this example board."]
+next_action = ["Inventory the required audio inputs before implementation."]
+evidence = []
+
+[[area]]
+id = "power"
+status = "planned"
+components = []
+paths = ["package/*Battery*", "package/*Battmgr*", "package/*Power*", "package/*PlatformPower*", "package/QcomQmp*", "package/QcomRpmh*", "package/QcomScm.h", "scripts/*power*", "scripts/*battery*", "scripts/*pmgr*"]
+inputs = ["Identify the power hardware, resources and existing component interfaces for this board."]
+configuration = ["Record the board.toml fields, DTS properties and defconfig values used for power."]
+procedure = ["Follow the power stage in the porting guide and record the actual commands."]
+findings = ["Collect the first power observation, its cause when established, and the resulting implementation decision."]
+completion = ["Declared power controls and battery readings match observations; each claimed sleep/resume transition restores its dependent peripherals."]
+limits = ["Hardware inputs and implementation are pending for this example board."]
+next_action = ["Inventory the required power inputs before implementation."]
+evidence = []
+
+[[area]]
+id = "packaging"
+status = "planned"
+components = []
+paths = ["scripts/*payload*", "scripts/*image*", "scripts/*flash*", "patches/**", "package/Kit.toml"]
+inputs = ["Identify the image assembly hardware, resources and existing component interfaces for this board."]
+configuration = ["Record the board.toml fields, DTS properties and defconfig values used for image assembly."]
+procedure = ["Follow the image assembly stage in the porting guide and record the actual commands."]
+findings = ["Collect the first image assembly observation, its cause when established, and the resulting implementation decision."]
+completion = ["Kernel and prelink succeed, payload contains all declared inputs, and the boot image matches the bootloader format and size limit."]
+limits = ["Hardware inputs and implementation are pending for this example board."]
+next_action = ["Inventory the required image assembly inputs before implementation."]
+evidence = []
+
+[[area]]
+id = "diagnostics"
+status = "planned"
+components = []
+paths = ["scripts/check-*", "scripts/probe-*", "scripts/audit-*", "scripts/read-*", "scripts/prepare-*", "scripts/data/**", "package/tests/**", "package/*Tests*", "package/*Diagnostic*", "package/*Probe*", "package/Boot*", "package/linux-log/**", "unixnu.lock"]
+inputs = ["Identify the diagnostics hardware, resources and existing component interfaces for this board."]
+configuration = ["Record the board.toml fields, DTS properties and defconfig values used for diagnostics."]
+procedure = ["Follow the diagnostics stage in the porting guide and record the actual commands."]
+findings = ["Collect the first diagnostics observation, its cause when established, and the resulting implementation decision."]
+completion = ["Each claimed milestone has a reproducible command, a matching source/image revision and an accessible result."]
+limits = ["Hardware inputs and implementation are pending for this example board."]
+next_action = ["Inventory the required diagnostics inputs before implementation."]
+evidence = []
+
+# H2 candidate: readonly 512-sector SHNGROOT windows over measured 4096-byte UFS.
+# OS volume identity and H1S hardware evidence: HANDOFF-2026-11-02 sections 16/17.
+# native-ufs-root-match-only stops before mount; root matching not yet hardware-qualified.
+
+
+[[area]]
+id = "owner-root-audit"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["drivers/Sm8250Ufs/RootOwner*.h", "drivers/Sm8250Ufs/OwnerVerifiedRoot.*", "drivers/Sm8250Ufs/OwnerCrypto.c", "patches/xnu/sm8250-h3c-owner-accept.patch", "scripts/build-sm8250-ufs.py"]
+inputs = ["Actual OS Volume UUID 04769D26-2CA0-4825-B443-E2E5F88300F2 and complete OS SHA256 e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2, independently checked in HANDOFF-2026-11-02.md sections17/25/26.", "Signed SMUOWN02 policy and independent public anchor from the H3B hardware-proven input; no private key in image."]
+configuration = ["UFS4096/window512/native4KiB unchanged; integrity units16384 bytes.", "native-ufs-owner-audit=1 verifies every delivered OS snapshot. Owner acceptance defaults off and additionally needs native-ufs-owner-trust=1, all four native refusal self-tests, immutable policy and fresh readonly mounted-media binding.", "native-ufs-owner-stop-after-devfs=1 is the H3C observation boundary."]
+procedure = ["Verify H3B source/image identity; run host gate, self-test and binding negatives before applying the board patch.", "Rebuild kernel, run final native ABI/call/stack audits, package and round-trip verify a separate boot image; user flashes it."]
+findings = ["H3B hardware: original APFS readonly mount/VFS_ROOT successful, signature/VM-protection/media-binding audit passed, checked204 bad0; Apple root authentication EAUTH80 still refused with trust0.", "H3C retains original Apple EAUTH and uses a distinct owner acceptance only if every predicate and native refusal self-test succeeds. No unconditional auth-return rewrite or storage writes."]
+completion = ["H3C hardware: self15/15 trust1 owner_auth1, checked218 bad0, actual devfs1/1 errno0. Original Apple authentication remains EAUTH80. See canonical HANDOFF section28."]
+limits = ["Independent owner policy is not Apple IM4M/SSV acceptance.", "H3C passed only its independent owner and devfs boundary; userspace execution/desktop remain unqualified."]
+next_action = ["Retain H3C acceptance conditions and qualify the H3D init/exec boundary separately."]
+evidence = [{ kind = "source", reference = "patches/xnu/sm8250-h3c-owner-accept.patch", result = "Default-off gated owner acceptance and immediate post-devfs observation; canonical hardware facts remain in the external HANDOFF sections25/26." }]
+
+
+[[area]]
+id = "init-exec-diagnostics"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3d-init-diag.patch"]
+inputs = ["H3C hardware report and archived source/image identity, canonical HANDOFF-2026-11-02.md section28."]
+configuration = ["native-ufs-init-diag=1 enables PID1-only exec observation; default off. H3C post-devfs stop argument is omitted.", "All existing signed readonly storage, native refusal selfchecks and independent owner acceptance predicates remain unchanged."]
+procedure = ["Observe original init allocation/copyout/path fallback and actual namei, permission, header read, image activator, process_signature and exec return values.", "Stop on the first non-ENOENT init result or after the original path list is exhausted; retain original fallback order and errors."]
+findings = ["H3E hardware: target original 21H461 static/system trust caches resolve the earlier EXEC/SECURITY_POLICY refusal with unchanged AMFI/signature code; /sbin/launchd process_signature1/1 and exec1/1 errno0, owner/selftest/read evidence preserved. Canonical HANDOFF section32."]
+completion = ["H3E init loading/signature/exec-return observed on hardware; actual user instructions remain unobserved."]
+limits = ["Even execve return0 is only the kernel loading boundary; it does not prove a launchd instruction ran.", "Apple SSV is still EAUTH80 and independent owner policy remains a distinct acceptance mechanism."]
+next_action = ["Rebuild and audit the exact final kernel and image; collect the full SMUFS root-h3d report."]
+evidence = [{kind = "source", reference = "patches/xnu/sm8250-h3d-init-diag.patch", result = "Default-off diagnostics without replacement init or signature-policy changes."}]
+
+
+[[area]]
+id = "pid1-user-svc-witness"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3f-user-svc.patch"]
+inputs = ["Same original 21H461 trust-cache bundle7416ca4f... used by hardware-passed H3E, canonical HANDOFF section32."]
+configuration = ["native-ufs-init-diag=2 continues successful exec and release-arms a one-shot observation; mode1 retains the old post-exec stop, default0 remains off.", "Original AMFI, signature checking, root owner predicates and readonly storage are unchanged."]
+procedure = ["Only a successful PID1 exec/signature snapshot can arm the witness. Acquire/CAS accepts a later PID1 AArch64 EL0 SVC with nonzero saved PC/SP.", "Record actual saved PC/SP/LR/CPSR/ESR/trap, then stop before syscall dispatch. Hook runs after original context checks and only with interrupts enabled."]
+findings = ["H3F hardware: PID1 EL0 SVC, trap74 mprotect, CPSR0 ESR56000080, user_seen1 gate2; original successful exec/signature, self15/15 trust1, owner_auth1, readonly root retained. Canonical HANDOFF section34."]
+completion = ["H3F EL0 SVC observed on hardware; mprotect arguments and handler errno remain unknown."]
+limits = ["First captured SVC after arming, not proof of the process's first instruction or launchd main.", "An earlier original panic or fault can occur before the witness; preserve it."]
+next_action = ["Rebuild/audit/package the exact kernel with unchanged original trust bundle; collect full SMUFS root-h3f and frames."]
+evidence = [{kind = "source", reference = "patches/xnu/sm8250-h3f-user-svc.patch", result = "Observation only; no user text/register or signature-state changes."}]
+
+
+[[area]]
+id = "pid1-mprotect-return-witness"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3g-mprotect-return.patch"]
+inputs = ["Hardware-passed H3F: PID1 EL0 SVC74, canonical HANDOFF section34. Same original 21H461 trust-cache bundle7416ca4f... ."]
+configuration = ["native-ufs-init-diag=3 continues the captured SVC74 into its original mprotect handler; modes1/2 and default0 remain available.", "AMFI/signature, readonly storage, root owner policy and native refusal selfchecks remain unchanged."]
+procedure = ["Release-publish the captured PID1 thread ID after the original successful exec and EL0 SVC predicates. Only that thread claims the one-shot handler observer.", "Public mprotect wraps the complete unchanged original body: record decoded raw addr/len/prot; call the original body once; record its BSD errno and stop. No user-register or protection rewriting."]
+findings = ["129 ASan/UBSan host checks pass after a red baseline mode3 test, including modes1/2, original init fallback, same-thread matching, raw arguments and handler errno forwarding."]
+completion = ["H3G hardware passed: original handler enter1 return1 errno0, addr100a4c000 len8000 prot1, mode3 stage15 gate5; canonical HANDOFF section36."]
+limits = ["Stops after the kernel handler returns, before syscall return translation or user resumption.", "Earlier original failures and syscall argument/filter refusals are preserved; no inferred handler success.", "Static/host evidence is not runtime or desktop qualification."]
+next_action = ["Rebuild, audit and package the exact mode3 candidate; collect full SMUFS root-h3g, arguments, errno and frames."]
+evidence = [{kind = "source", reference = "patches/xnu/sm8250-h3g-mprotect-return.patch", result = "Observation only; original mprotect body and security decisions retained."}]
+
+
+[[area]]
+id = "pid1-user-resume-witness"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3h-user-resume.patch"]
+inputs = ["H3G original mprotect handler success on hardware, canonical HANDOFF section36. Same original21H461 trust bundle7416ca4f... ."]
+configuration = ["native-ufs-init-diag=4 continues original mprotect only after its observed success; modes1/2/3 and default0 retained.", "Original syscall dispatch/return, AMFI/signature, readonly root owner/selftests and storage geometry remain unchanged."]
+procedure = ["After the same PID1 thread completes the original mprotect body with errno0, release-publish gate6 and return through the original wrapper and syscall machinery.", "In the existing SVC64 exception path after original context/IRQ checks, acquire gate6 and require same PID1/thread, successful prior handler snapshot and a valid EL0 SVC. CAS6->7 captures separate saved resume registers/trap, then stops before dispatch of that later SVC.", "A nonzero original handler errno still stops at mprotect-return; earlier native failures remain intact."]
+findings = ["167 ASan/UBSan actual-source host checks pass after the H3G mode4 red baseline. Host checks prove observer control flow, not architectural EL0 return."]
+completion = ["H3H candidate awaits native same-thread later-SVC observation."]
+limits = ["Later SVC is not necessarily a distinct PC or launchd main; no desktop qualification.", "No later eligible SVC or an earlier original failure must not be counted as a pass.", "Stops before handling the captured later SVC; its handler result remains unknown."]
+next_action = ["Rebuild/audit/package mode4; collect full SMUFS root-h3h, initial/resume saved registers, mprotect snapshot and frames."]
+evidence = [{kind = "source", reference = "patches/xnu/sm8250-h3h-user-resume.patch", result = "Observation only; original mprotect body/wrapper and syscall return untouched."}]
+
+[[area]]
+id = "systemos-cache-probe"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3j-cache-probe.patch", "drivers/Sm8250Ufs/RootOwnerBinding.h", "drivers/Sm8250Ufs/RootWindowDevices.h"]
+inputs = ["H3I hardware dyld namespace6/subcode1: /usr/lib/libSystem.B.dylib missing, no dyld cache. Canonical HANDOFF section40.", "Same21H461 SystemOS full SHA256 b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f; actual APFS Volume UUID8846FE78-2910-4297-AF97-D59BB6F8FC16."]
+configuration = ["native-ufs-cache-probe=1, PID1 only; default0 and init diagnostics0. Planned stop before init exec.", "Native readonly non-union APFS mount at existing /private/preboot. No dyld environment or executable cache mapping."]
+procedure = ["Freshly revalidate existing OS owner policy before and after the diagnostic mount and after reads; retain original Apple EAUTH80.", "Select one native readonly typed SystemOS IOMedia by actual volume UUID, reject duplicates, bind post-mount dev_t/registryID, preserve OS rootvnode.", "Native APFS read of main cache and all52 required subcache headers; validate arm64 magic and actual expected UUIDs, main platform2/image3354/subcache52 and libSystem path at host-verified offset276462. Stop with original mount/lookup/read errno or probe-complete."]
+findings = ["Host readonly APFS walk finds54 cache files including symbols. Main arm64 UUID590d839a-82d2-30f1-a17d-0cc053420f73 contains3354 images including libSystem and52 subcaches.", "Two mandatory LINKEDIT subcaches are decmpfs14 compressed: native decoder still requires hardware observation.", "Official Apple APFS reference and dyld1122.1 format/runtime source consulted; actual format offsets checked against this21H461 cache. Public source tag is a format reference, not an asserted exact target dyld revision."]
+completion = ["H3J diagnostic candidate; native mount/reads and hardware outcome pending."]
+limits = ["SystemOS is outside the current signed OS reader. This probe only reads bytes; sys-integrity0/cache-exec0. Host full-window hash is source identity, not device-time verification.", "No AMFI/signature/trust changes or private-key operations. SystemOS integrity coverage is required before enabling cache execution.", "Host shims and static audits do not qualify native APFS decompression, dyld startup or desktop."]
+next_action = ["Build/audit/archive H3J; user manually flashes candidate and returns full SMUFS cache-h3j report and frames."]
+evidence = [{kind="source", reference="https://unixnu.com/concepts/security", result="Keep original Apple checks; distinguish explicit owner policy and verified code inputs."}, {kind="source", reference="https://github.com/apple-oss-distributions/dyld/blob/dyld-1122.1/cache-builder/dyld_cache_format.h", result="Main/subcache UUID, image table and platform layout reference validated against actual cache bytes."}]
+
+[[area]]
+id = "systemos-pinned-read-integrity"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["drivers/Sm8250Ufs/RootSystemRead.h", "drivers/Sm8250Ufs/RootSystemPolicy.h", "drivers/Sm8250Ufs/SystemOsPin.h", "patches/xnu/sm8250-h3k-systemos-integrity.patch", "scripts/build-sm8250-ufs.py"]
+inputs = ["H3J hardware passed readonly SystemOS mount and all53 required cache header reads; canonical HANDOFF section42.", "Original21H461 SystemOS3303014400 bytes SHA256 b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f.", "201600 SHA256 entries for16KiB units. Table6451200 bytes SHA256 e2b7042d7280f93c87743fd0bec00198e12681ad80553e89953e886e42b41114, independently compiled pin."]
+configuration = ["native-ufs-cache-probe=2 enables H3K verified read probe; default off and H3J mode1 retained.", "The SystemOS trust anchor is a kernel-compiled digest of an exact original-image-derived table. It is separate from signed SMUOWN02 OS policy and does not claim Apple SSV or a newly signed envelope.", "No private-key operation; original OS owner/selftests, AMFI, original trust bundle and code signatures retained. UFS4096/window512/native4KiB unchanged."]
+procedure = ["Before publishing SystemOS, check full table digest and three refusal cases, restore, recheck, copy to private VM and protect readonly. Only then release-publish readiness.", "Route every delivered SystemOS window request through a16KiB staged hash check; use the same checked bytes for staging/copy. Failed transport/digest closes admission and delivers zero bytes.", "Native first-read corrupt/restore selftest adds bit8 to the initial mask7. Fresh snapshot verifies VM read/write protection, counters and mask15; mounted device/UUID/readonly binding and OS root checks retained.", "Stop at verified-cache-probe-complete after53 headers and libSystem string check; no cache execution or dyld environment enabled."]
+findings = ["H3J native APFS requested header ranges in both compressed LINKEDIT subcaches are readable, not whole-file validation.", "Host real-SHA fixture and actual Linux readonly-memory negatives precede production changes; native behavior still requires H3K hardware report."]
+completion = ["H3K candidate pending native integrity-path observation."]
+limits = ["Read coverage means each delivered request is verified; checked is not a unique-unit or full-device scan counter.", "Original cache CodeDirectory mapping, dyld discovery, launchd and desktop remain unqualified.", "Private VM/table pin is an explicit independent integrity policy, not Apple signature acceptance."]
+next_action = ["Build/audit/package H3K and obtain complete native policy flags15/self15/bad0 and mount/cache report before enabling cache execution."]
+evidence = [{kind="source", reference="https://unixnu.com/concepts/security", result="Preserve original Apple security components, distinguish supplied inputs and explicit root trust policy."}]
+
+[[area]]
+id = "verified-systemos-cache-continuation"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["drivers/Sm8250Ufs/RootSystemPolicy.h", "patches/xnu/sm8250-h3l-cache-continue.patch"]
+inputs = ["H3K hardware passed independent SystemOS pin/readonly policy flags15 self15, checked473 bad0, native53/53 cache header reads; canonical HANDOFF section44.", "Original21H461 SystemOS and unchanged compiled16KiB hash table; original OS signed policy and original trust-cache bundle7416ca4f... retained."]
+configuration = ["native-ufs-cache-probe=3 continues original init after verified cache preparation. Modes1/2 retain diagnostic stops; default0 remains off.", "SystemOS verified reader stays enabled in both modes2 and3. No AMFI policy rewrite, signature bypass, union mount, private key or storage write."]
+procedure = ["Retain original readonly SystemOS mount, unique actual volume UUID/dev_t/registryID binding, all53 headers and known libSystem member-path check, fresh OS owner and SystemOS pin/readonly/self15/bad0 checks.", "Immediately before environment publication, freshly rebind the mounted readonly SystemOS device/media. Only after success copy the fixed DYLD_SHARED_CACHE_DIR string and two-entry64-bit env vector into original init scratch offsets0x400/0x500.", "Recheck OS root identity/owner and SystemOS policy after copyout, free the transient probe context and return envp to the unchanged original init loader/exec fallback path. Preserve all preparation/native errors."]
+findings = ["Official dyld source CacheFinder considers DYLD_SHARED_CACHE_DIR before default cache location; iOS environment handling differs from macOS pruning. Exact target revision/acceptance evidence is recorded with external candidate artifacts; native discovery/mapping still requires hardware.", "Passing an environment string is a request to the original dyld. It does not replace its cache header, subcache, signature or mapping checks."]
+completion = ["H3L candidate awaits actual dyld cache discovery/signature mapping or the next native failure."]
+limits = ["Prepared output is not proof of execution or libSystem loading. No artificial stop on each normal syscall.", "SystemOS integrity remains the independent kernel-pinned table policy, distinct from signed SMUOWN02 OS policy and Apple SSV.", "Host VFS/exec shims do not qualify native dyld/cache mapping or desktop."]
+next_action = ["Build/audit/package H3L; user manually flashes candidate and returns actual boot outcome, complete native panic/frames if any, or the last visible output on stall/reboot."]
+evidence = [{kind="source", reference="https://github.com/apple-oss-distributions/dyld/blob/dyld-1122.1/dyld/DyldProcessConfig.cpp", result="Public reference for CacheFinder/environment behavior; exact target binary evidence is kept with the candidate."}]
+
+[[area]]
+id = "verified-systemos-cache-carrier"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3m-cache-carrier.patch"]
+inputs = ["H3L delivered kernel and immutable source archive; HANDOFF sections45-47.", "Original21H461 OS/SystemOS inputs, original7416ca4f trust bundle and independent SystemOS pin remain unchanged."]
+configuration = ["Mode3 and all H3K/L gates remain unchanged. Only fully prepared mode3 publishes immutable cache/root/media identity for the strict carrier.", "No original GF owner macro is enabled; use the board smufs authorization APIs. No AMFI, code-signature, shared-region range, scdir-enforcement or user executable patch."]
+procedure = ["For a failed original cross-volume preboot check, additionally accept only current owner-authorized rootvnode, the prepared distinct readonly APFS mount, actual dev_t and freshly unique SystemOS registry media, a held fixed directory/parent identity and one of53 cache names.", "Recheck SystemOS flags15/self15/checked-positive/bad0 and owner root immediately before acceptance; release held parent/name/directory references on every outcome.", "Record actual PID1 shared_region_map_and_slide_2_np entry and original return. Prefix the existing final init panic with carrier counters/first refusal stage and mapping status; do not add a planned stop or change errno."]
+findings = ["Original H3L reads all53 cache headers but retains the original /private/preboot/Cryptexes volume check; the direct SystemOS mount lacks that directory.", "Host original policy branch rejects the expected volume; the staged carrier passes it and retains negative identity/integrity cases. Host models do not establish native dyld mapping success."]
+completion = ["H3M source and host checks implemented; candidate requires native hardware verification."]
+limits = ["No claim of AppleSSV, dyld cache mapping, launchd services or desktop until actually observed.", "First actual native cache failure may precede shared-region. A zero carrier count is evidence that this gate was not observed."]
+next_action = ["Build and audit H3M, package below96MiB, user manually tests the exact candidate and returns the final screen or actual boot result."]
+evidence = [{kind="source",reference="https://github.com/GFander/UniXNU/blob/7851dae09d6dcdaaaeeada7bb2dc94f8af5771fc/patches/xnu/offline-owner-cache-carrier.patch",result="Reference for strict independent carrier; board implementation uses existing smufs owner and SystemOS verification, not its native_verified_block API."}]
+
+[[area]]
+id = "verified-systemos-early-cache-io-evidence"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3n-cache-io.patch"]
+inputs = ["H3M actual final panic: prep1, carrier0/0, PID1map0/0; HANDOFF section49.", "Original dyld1165.3 console and simple_vdprintf instructions; PID1 opens console and writes formatted text in short chunks."]
+configuration = ["Unchanged mode3, H3M strict carrier, original21H461 trust bundle, OS owner and independent SystemOS verified reads.", "Observe only PID1 after preparation publication. No altered I/O return, signature result, mount, storage policy or planned stop."]
+procedure = ["Capture first32 open/openat inputs with directory-fd, bounded user path and actual error/descriptor; count requests and retained completed records.", "Retain actual fstat64/pread result and F_ADDFILESIGS_RETURN entry/return, first signature errno and returned coverage when readable.", "Bounded copy of attempted PID1 writes reassembles per-fd lines and retains first matching shared-cache/ignition diagnostics; copy failures and contention only drop evidence.", "Extend existing final critical-exit note with bounded evidence while retaining original panic reason and H3M carrier/map counters."]
+findings = ["H3M did not observe entry to the shared mapping syscall. Its zero errno fields were defaults, not successful results.", "Original notes and an unassembled short-write observer both fail host controls; candidate retains complete representative dyld error text and original I/O behavior."]
+completion = ["H3N observation source and host checks implemented; native error still requires the next manual device test."]
+limits = ["First32 paths and bounded diagnostic lines may truncate; D row prefers cache directory and otherwise shows the last completed open. Paths are user input, relative names retain their dirfd.", "No cache mmap instrumentation is added; its failure may instead appear in the original captured dyld diagnostic.", "Host mocks and static audits do not qualify native I/O or cache execution; no successful boot claim."]
+next_action = ["Build/audit/package H3N; user manually boots exact candidate and returns new prefix plus complete original failure."]
+evidence = [{kind="source",reference="https://github.com/apple-oss-distributions/dyld/blob/dyld-1165.3/dyld/SharedCacheRuntime.cpp",result="Original preflight performs fstat/pread, signature registration and first-page mmap before shared mapping."}]
+
+[[area]]
+id = "verified-systemos-cache-init-stdio"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3o-cache-stdio.patch"]
+inputs = ["H3N native: override directory open fd0/error0, relative main-cache openat dirfd0/error9=EBADF; no cache pread/signature/map observed.", "Actual original21H461 dyld f8df3c58: CacheFinder opens override before ignite; PID1 ignite replaces and closes fd0/1/2 before returning."]
+configuration = ["Verified mode3/currentPID1 only, after unchanged carrier publication and before original init exec.", "Prepare standard0/1/2 with original kernel openat_internal on /dev/null using UIO_SYSSPACE; no CLOEXEC. Original dyld/ignition and all original openat/signature checks remain."]
+procedure = ["Require all standard descriptors absent; reject any existing descriptor without overwriting or closing it.", "Open /dev/null sequentially as read-only stdin and write-only stdout/stderr with O_NOCTTY; require actual descriptors0/1/2. On failure preserve original error and attempt to close only newly created descriptors in reverse order; init stops.", "Original dyld then obtains cache directory fd>=3, outside the standard descriptors owned by libignition. Retain H3N actual I/O and final failure note, tagged H3O with completed stdio mask7."]
+findings = ["Host original syscall order reproduces fd0/EBADF; actual candidate helper makes directoryfd3 survive original ignition standard-fd cleanup and open/read main cache."]
+completion = ["Host ASAN/UBSAN helper/failure cleanup checks and real host fd sequence pass. Device validation pending."]
+limits = ["Host fd operations are not native APFS/dyld execution. Passing this boundary does not prove cache signature or shared mapping.", "Existing standard descriptors reject with EBUSY; cleanup errors are not treated as a recovered boot, and init stops on the original failure."]
+next_action = ["Build/audit/package H3O; user boots manually and returns directory/cache fd/error plus original cache signature/map or final failure."]
+evidence = [{kind="source",reference="HANDOFF-2026-11-02.md section51; h3n-hardware-evidence actual-dyld instructions",result="Observed fd0/EBADF agrees with override-open before libignition stdio ownership and cleanup."}]
+
+[[area]]
+id = "continuous-readonly-root-provider"
+status = "implemented"
+components = ["NativeUfs"]
+paths = ["drivers/Sm8250Ufs/NativeUfs.cpp"]
+inputs = ["H3O actual planned20second productionReport panic; windows published, late1/stable1/online1, accepted/completed4571/4571 reject0; HANDOFF section53.", "Original IOLib IOExitThread uses thread_terminate(current_thread()); original kernel thread_terminate handles self APC AST and never returns."]
+configuration = ["native-ufs-root=1 preserves the existing diagnostic; explicit root=2 may continue after the same late read and snapshot.", "All H3O BSD/cache/stdio/rootauth/AMFI policies and original21H461 trust remain; no new kernel patch or board change."]
+procedure = ["After unlocking the storage startup gate, only root2 plus registered/online/readonly/whole/geometry/manifest/windows/probe/late-stable health and both window registration/geometry may skip the planned observation panic.", "Recheck blockCancelled before continuing; allow legitimate inflight reads. Other modes or failed health retain original observation panic.", "The observer kernel worker calls original thread_terminate(current_thread()) after a normal report return; unexpected API return is fatal. Provider/DMA references and backend remain online under their original lifetime."]
+findings = ["H3O reached the artificial observer before a visible original DYLD final failure; this screen does not expose cache fd/signature/map or launchd status."]
+completion = ["Actual original/candidate report and worker bodies pass host sanitizer branch and termination checks; native continuation pending."]
+limits = ["Provider health is not root/cache authorization. No cached signature/map or userland-success claim.", "Later critical-exit reports retain the H3O cache observer prefix because BSD code is unchanged; black screen is not successful boot."]
+next_action = ["Build/audit/package exact root2 H3P; user boots manually and returns actual next panic or visible startup result."]
+evidence = [{kind="source",reference="HANDOFF-2026-11-02.md section53 and h3o-hardware-evidence",result="Matching source and frames identify unconditional planned observer after IOSleep20000, while provider late-read health remains good."}]
+
+[[area]]
+id = "native-mount-critical-exit-output"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3q-mount-output.patch"]
+inputs = ["H3P hardware: PID1 shared_region map1/1 return0, carrier53/0; mount[3] exits66 normally, IO trace unavailable; HANDOFF55.", "Actual original21H461 mount f7f7aa9b has missing boot-manifest-hash failure path; exact H3P ADT lacks hash. Current native stderr still unknown."]
+configuration = ["Unchanged H3P root2/cache3/init0, original trust, all owner/SystemOS/AMFI and critical-exit behavior.", "PID1 writer guard remains; prepared-state readers may include exiting nonPID1 children."]
+procedure = ["Read retained PID1 I/O using its own nonblocking prepared-state snapshot lock instead of the PID1-only writer gate.", "Only first process named exactly mount after prep, on fd1/2, captures bounded attempted write/writev output. Keep last320 bytes from up to512 initial bytes per chunk; inspect at most8 arm64 user_iovec64 entries.", "Nonblocking contention/copy faults only lose diagnostic data. Preserve original write/writev inputs, call count, outputs, errno and critical-exit conditions.", "Include process-bound mount tail and PID1 snapshot in original final panic; no planned stop or boot identity publication."]
+findings = ["Old observer fails PID3 readback and mount error retention controls; candidate host checks pass."]
+completion = ["Observation-only source and host checks implemented. Native error remains pending next manual test."]
+limits = ["Captures attempted user output, not proof console write succeeded. First mount only; later PID is labelled current separately and cannot overwrite prior record.", "Output may truncate, iovec copy or lock contention may lose evidence; copy_error is diagnostic, not syscall errno.", "No boot-manifest identity is fabricated; no userland/Data/rootfs or security policy change."]
+next_action = ["Build/audit/package H3Q and return exact manual flash commands; user returns mount-output tail and complete original panic."]
+evidence = [{kind="source",reference="HANDOFF55; h3p-hardware-evidence/mount-reference; GF fixed7851dae check-mount-phase-checkpoints.py",result="Potential identity prerequisite is known but actual local stderr must identify the failure before changing startup semantics."}]
+
+[[area]]
+id = "native-owner-bootset-identity"
+status = "implemented"
+components = ["XnuPrelink", "Sm8250Ufs"]
+paths = ["drivers/Sm8250Ufs/RootBootSet.h", "drivers/Sm8250Ufs/RootOwnerPolicy.h", "drivers/Sm8250Ufs/RootProduction.h", "patches/xnu/sm8250-h3r-owner-bootset.patch"]
+inputs = ["H3Q hardware: original mount pid3 fd2 reports missing boot-manifest-hash, exits66. Data explicitly not required; HANDOFF57.", "Actual original21H461 mount reads /chosen/boot-manifest-hash. GF7851dae owner domain reference is not an Apple firmware identity and its signed-SystemOS API differs."]
+configuration = ["Unchanged H3Q root2/cache3/init0 and original trust; explicit owner-audit1/owner-trust1 remain required.", "Independent SMUFS.OwnerBootSet.v1 domain; OS RSA3072-SHA256 owner envelope, SystemOS kernel SHA256-pinned immutable table. No Apple firmware personalization assertion."]
+procedure = ["Retain private OS policy allocation identity only after original signature checks, selftests and read-only protection succeed.", "Before original init exec, after unchanged root/cache actual readonly mounts, fresh media UUID/type/provider bindings and all cache/header/integrity gates, derive SHA384 in a canonical role/kind/length/metadata domain.", "Recheck OS owner acceptance and VM protections, SystemOS snapshot flags15/self15/read counts/no failures, actual selected media and pinned table before hashing private immutable inputs.", "Publish /chosen/boot-manifest-hash as48 bytes with owner-boot-manifest-domain and explicit policy provenance. Refuse all existing hash/domain/policy conflicts; allocate before changes; read back through original IOGetBootManifestHash; roll back only properties still owned by failed attempt.", "Publication failure stops through existing prepare error report; original AMFI/root authentication result80/critical-exit/mount user program remain unchanged. Preserve H3Q attempted mount-output and provider continuous operation."]
+findings = ["Host original getter lacks identity; candidate57 assertions pass against independently encoded real immutable policy/table SHA384. This is not native mount continuation proof."]
+completion = ["Source and host behavior implemented; fresh build, final code/image audits and manual native test required."]
+limits = ["Owner image-set metadata serves original boot consumers; it is not Apple secure boot/SSV/SEP enrollment or writable Data provisioning.", "Registry publication has one early PID1 caller before userspace. Conflicting initial properties refuse rather than overwrite; no general concurrent registry transaction primitive is introduced.", "GF signed-SystemOS manifests are not imported; this board continues its separate kernel-pinned SystemOS trust model.", "Later preboot/Data/timezone/keybag/desktop failures remain possible and must retain original errors."]
+next_action = ["Build/audit/package H3R, deliver manual boot commands, inspect bootset status0/exact SHA384 and original subsequent native outcome."]
+evidence = [{kind="source",reference="HANDOFF57; h3q-hardware-evidence; GF fixed7851dae offline-owner-boot-manifest.patch; UniXNU official device-tree and bring-up guides",result="Native missing identity cause confirmed; owner identity implementation uses this board's actual verified policies, no copied digest or bypass."}]
+
+[[area]]
+id = "native-tzinit-symlink-observation"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3s-tz-symlink.patch"]
+inputs = ["H3R hardware owner publication/readback status0, cache mapping return0; original tzinit[17] exits normally30. Mount output is retained pid3, not current pid17. HANDOFF59.", "Same XNU EROFS30; original21H461 tzinit76e8439e uses timezone paths under readonly /var; GF7851dae observed symlink EROFS30. Local syscall arguments/errno still unobserved."]
+configuration = ["All H3R parameters, trust, OS owner/SystemOS pin/boot-set provenance and original security/critical-exit behavior retained."]
+procedure = ["After verified cache prep only, bind records to first process exactly named tzinit. Record up to4 never-reused symlink/symlinkat attempts with op/fd and at most159 characters per original user path.", "Call original symlinkat_internal once with exact original arguments, context and segment; record the actual original returned errno afterwards, return it unchanged and preserve retval.", "Use nonblocking admission and immutable completed records. Copied path faults/truncation, dropped admission and missing returns remain diagnostic; first completed failure is selected for final panic.", "Append tz-symlink pid/current/entered/returned/drop/op/fd/errno/copy/source/link to original final critical-exit report; no new planned stop, VFS lookup or changed filesystem operation."]
+findings = ["Actual observer and original/candidate syscall wrappers pass20 ASAN/UBSAN assertions; original report does not preserve syscall error/path. Host proc/copy/original syscall are models."]
+completion = ["Observation-only source and host checks implemented; native tzinit operation evidence pending."]
+limits = ["Four records only; later attempts/admission contention may be dropped. Copies are bounded attempted arguments, not atomic snapshots of user memory.", "Additional copyinstr user memory access may fault through original VM; no explicit additional VFS/device I/O is introduced.", "Mount[3] historical output and current tzinit[17] syscall evidence remain separately labelled.", "No writable Data, root mount flag change, fake success, tzinit bypass, GPT/userdata write or private key operation."]
+next_action = ["Build/audit/package H3S, return manual flash commands and inspect original symlink errno/path before provisioning independent writable Data."]
+evidence = [{kind="source",reference="HANDOFF59; h3r-hardware-evidence; original tzinit76e8439e and same XNU errno.h; GF7851dae owner boot-manifest checkpoints; official userdata guide",result="Readonly timezone update is a supported hypothesis; native local syscall evidence is still required."}]
+
+[[area]]
+id = "smufs-volatile-apfs-data"
+status = "implemented"
+components = ["RamBlock", "XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3t-ram-data.patch", "scripts/build-sm8250-ram-block.py", "configs/instantnoodlep_defconfig", "proprietary-files.txt"]
+inputs = ["H3S native original tzinit symlink /var/db/timezone/zoneinfo -> /usr/share/zoneinfo.default returned EROFS30, HANDOFF61.", "User-authorized ye3912/apfs Actions run41785622896: Apple-formatted 256MiB APFS seed, original21H461 var tree (206 entries/39 files), Apple fsck and independent raw checksum/tree checks."]
+configuration = ["CONFIG_XNU_NATIVE_RAM_BLOCK=y; DBRDISK1 payload input; board-local pinned RamBlock derivative removes unselected persistent backend, keeps real volatile RAM reads/writes and leaves upstream component files unchanged.", "OS/SystemOS/root owner, bootset, trustcache, original auth/AMFI/signatures and launchd/tzinit binaries remain unchanged."]
+procedure = ["After verified readonly SystemOS and independent owner bootset, bind exactly one typed RAM provider volume UUID and initial logical seed hash, excluding OS/SystemOS device IDs.", "Use original APFS mount at /private/var with flags0, validate actual device/APFS/RW, unchanged readonly root/SystemOS, same typed seed identity and /var/db/timezone mount binding.", "Continue original carrier, stdio and launchd only after successful preparation; retain original H3S symlink observer and critical-exit behavior. Any real preparation error stops with exact stage/errno.", "Audit190 concrete storage slots/24 overrides/11 original imports; share existing board aliases and add only the nonoverlapping qualified doUnmap alias."]
+findings = ["Initial seed UUID/hash/size are compiled pins, not authentication of later mutable Data content. No keybag provisioning or native success claim."]
+completion = ["Source staged with bounded real-error gates; native build/mount/tzinit evidence remains pending."]
+limits = ["Volatile RAM Data is discarded on reboot. Factory initial var only; staged_system_apps excluded. No production storage or full startup qualification.", "Mac formatter and host checks do not prove compatibility with the original iPadOS APFS driver. Original mount failure remains visible."]
+next_action = ["Build/package and check the actual new interfaces and image. User authorized direct boot flashing via Desktop/flash/adb-fastboot after necessary target checks; do not repeat unaffected old tests."]
+evidence = [{kind="host",reference="https://github.com/ye3912/apfs/actions/runs/41785622896",result="Apple fsck and factory tree/identity checks passed; native Data pending."}]
+
+[[area]]
+id = "smufs-watchdog-brk-observation"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3u-watchdog-brk.patch"]
+inputs = ["Native H3T Data stage5/errno0 and original tzinit symlink errno0; watchdogd97 critical exit SIGNAL2/SIGTRAP5 without fault PC.", "Original21H461 watchdogd ded4c688e1c2add74acf3e7f9eea5fe2c2c569180ce81492221877944d913a01 has several BRK sites, including absent IOWatchdog and IOServiceOpen errors."]
+configuration = ["Unchanged H3T boot arguments, volatile Data seed, root/SystemOS policies, trustcache and firmware.", "Observe only the first watchdogd EL0 BRK after strict carrier preparation; original exception and critical-exit behavior remain."]
+procedure = ["Before original handle_breakpoint, with interrupts enabled, snapshot original PC/SP/LR/x0/CPSR/ESR; single nonwaiting CAS and release publication.", "Attempt at most64 code bytes and two160-byte user strings; retain copy errors and overflow guards. Decode only an actually observed ADR-x0/NOP/BL/BRK sequence, reading the live literal.", "Append snapshot ahead of historical cache output in the existing critical-exit note, without planned stop or modified signal/return."]
+findings = ["Host actual observer with original BRK bytes and ASLR/live message, negative ADR, copy faults, length bounds and publication cases passed ASAN/UBSAN; OS APIs are modelled.", "H3T native Data and timezone success are distinct from the still unqualified watchdog service and desktop."]
+completion = ["Capture actual original watchdogd fault PC and64 code bytes/live diagnostic message, then identify the exact original branch."]
+limits = ["User copies can page in and affect timing. An unobserved/incomplete record or copy failure cannot prove a branch absent.", "No watchdog service, hardware watchdog programming, launchd override or crash-policy change is added."]
+next_action = ["Build and check affected code/image, automatically flash only boot_a under existing user authorization, and obtain the original next panic."]
+evidence = [{kind="device",reference="HANDOFF-2026-11-02.md section65",result="H3T Data/tzinit success; watchdogd SIGNAL2/SIGTRAP5, exact native fault branch pending."}]
+
+[[area]]
+id = "smufs-original-watchdog-service"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["package/SmUfsWatchdog.cpp", "package/SmUfsWatchdog-NOTICE.txt", "scripts/build-sm8250-watchdog.py", "patches/xnu/sm8250-h3v-watchdog-service.patch"]
+inputs = ["H3U native first watchdogd52 PC/live ADR message proves original21H461 missing-IOWatchdog lookup BRK; final97 critical exit is a distinct PID.", "MIT mouse233/unixnu-fuxi9644d94e6bb050e4bde5f50f94312dd10cd3f416 original-service backend; same kernelcache f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7, exact171 slots/248-byte base/232-byte client/5 bindings and heartbeat fields."]
+configuration = ["Board-owned service initialized once after strict Data preparation, before original launchd; no new boot arguments.", "New late object and uniquely named SmUfsWatchdog-bindings.o are collected in the existing board platform-power archive, preserving original PMGR members and aliases."]
+procedure = ["Load the original AppleARMWatchdogTimer module, check exact base/client metaclasses/sizes and absence of an existing service, late-register real SmUfsPlatformWatchdog subclass under kernel pre/postModLoad.", "Delegate original start, client root/entitlement/type/exclusive checks, selectors, enabled/sequence/deadline and IOKit monitoring. Synchronously publish and require exactly one matching service identical to this object.", "Use a real thread_call each second to inspect original enabled/sequence/deadline under its original simple lock. True enabled deadline expiry panics; no heartbeat/deadline fields are written by the backend.", "Serialize scheduling against stopping, disarm/cancel and wait for callbacks before the original stop releases its lock; drain/free timer and gate in free. Preparation failure stops with exact step/errno/raw."]
+findings = ["Host production backend passed ASAN/UBSAN with explicitly modelled IOKit/thread/original APIs; deleting expiry, original denial, stop drain or synchronous registration each failed.", "ABI native standalone compile/171 slots/5 bindings/original module text passed before integration. New service and heartbeat behavior remain unqualified on device."]
+completion = ["Native stage3 ready and unique matching service; original client succeeds under original policy, polls and real heartbeat sequence/deadline advance without old lookup BRK."]
+limits = ["Software deadline backend can detect userland heartbeat expiry only while the kernel scheduler/timer runs. Independent Qualcomm hardware WDT is not implemented; no WDT MMIO.", "Original security/critical handling, OS/SystemOS readonly roots and volatile Data seed remain. Host models do not prove native services or full startup."]
+next_action = ["Build and inspect actual final service code/bindings/archive/initialization and image; automatically flash only boot_a under user authorization and obtain native evidence."]
+evidence = [{kind="device",reference="HANDOFF-2026-11-02.md section67",result="Original native missing-service BRK identified; Data and original tzinit success retained."}, {kind="host",reference="https://github.com/mouse233/unixnu-fuxi/blob/9644d94e6bb050e4bde5f50f94312dd10cd3f416/package/RamWatchdog.cpp",result="Reviewed MIT reference with board scheduling/drain changes and attribution; no foreign hardware constants used."}]
+
+[[area]]
+id = "smufs-watchdog-owner-policy"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["scripts/adapt-sm8250-watchdog-policy.py", "patches/xnu/sm8250-h3w-watchdog-policy-observer.patch", "package/SmUfsWatchdog.cpp"]
+inputs = ["H3V native stage3/polls364, clients0/beats0; first watchdogd52 exact original IOServiceOpen failure BRK at0x10000ab54. Actual policy errno not captured.", "GF88da12ad589eb80f116180822a52cfbdac76d115 Sandbox/watchdog record; original21H461 cache pinned, unique readonly21-byte Apple hardware condition maps to real SmUfsPlatformWatchdog."]
+configuration = ["Explicit board owner policy derivative; not an unmodified or Apple-authenticated policy. Original executable code/security checks remain."]
+procedure = ["Guard original cache, candidate/plan identity, exact module/read-only segment/context/real linked class, unchanged original Sandbox/Watchdog executable, then derive a separate candidate with only the21-byte condition mapped.", "Record original target service MACF result and read-only IOResources negative control using the same credential/type. Do not open control or change original target checks/returns. Record original newUserClient result."]
+findings = ["H3V native service and software timer were observed, but the original IOServiceOpen failed. H3W actual observer and same-credential control block passed host ASAN/UBSAN with explicit KPI models; three deliberate observer failures were rejected.", "Final native37-function object/call audit and current storage ABI passed; explicit owner derivative changes only21 readonly condition bytes, with original Sandbox/Watchdog executable unchanged. Native authorization/client/heartbeat remain pending."]
+completion = ["Original policy target accepts while unrelated control denies; original client/heartbeat advance on device."]
+limits = ["Software watchdog only; independent hardware WDT and full user startup pending. Diagnostic snapshot stores first PID separately from final critical PID."]
+next_action = ["Build and inspect actual candidate, apply explicit owner mapping, package/check, flash new boot_a under existing user authorization."]
+evidence = [{kind="device",reference="HANDOFF-2026-11-02.md section69",result="H3V original IOServiceOpen failure; ready/polls but no client or heartbeat."}]
+
+[[area]]
+id = "smufs-boot-status"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["package/SmUfsBootStatus.cpp", "scripts/build-sm8250-boot-status.py", "patches/xnu/sm8250-h3x-boot-status.patch"]
+inputs = ["H3W user transcript: target0/control1,clients3,result0,beats0. First watchdogd52 original BRK0x10000b160 is missing IOService/IOPropertyMatch{IOPMUPrimary:1}; final PID127 PC not captured.", "Original21H461 watchdogd SHA256 ded4c688e1c2add74acf3e7f9eea5fe2c2c569180ce81492221877944d913a01; exact16-word match, ASLR0x929000."]
+configuration = ["Explicit RAM-only software boot-status interface. No physical PMU/PON, persistence, power, reset or RTC backend. Original MACF and root-only setter; unknown/mixed keys and out-of-range values rejected."]
+procedure = ["Publish exactly one IOPMUPrimary numeric1 before original launchd; accept root-only IOPMUBootStage0..255 and expose bounded actual write diagnostics.", "Affected setter host checks with two broken variants; current target compile/link and final policy/image readback. Reuse unchanged storage, seed, watchdog lifecycle and policy tests."]
+findings = ["Implementation/host checks complete; final build and native publication/write/heartbeat result pending."]
+limits = ["Volatile compatibility state only; no hardware PMU claim. Native MACF may independently reject property requests; original checks are retained."]
+next = ["Capture H3X boot-status readiness/writes and original watchdog sequence progression, or next original BRK."]
+
+[[area]]
+id = "smufs-cpu-publication"
+status = "implemented"
+components = ["ArmDTPlatform", "ArmCpu", "XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3y-cpu-publication.patch"]
+inputs = ["H3X user snippet: waitQuiet60s, cpu1/cpu2/cpu3 each state0xa/0x04020001; final embedded kernel symbols identify waitQuiet+0x464. Actual client PID and bound CPU class were not supplied.", "UniXNU official platform/drivers/device-repository; GF88da12ad589eb80f116180822a52cfbdac76d115 patch0168 preserves DT CPUs without publishing unsupported CPU nubs.", "Selected ArmCpu9066b53bbc82e92a98ec44a11dd50fd13eaf1a1b probe requires bootCPU or sheng-smp!=0 and logical0..7. Current245-byte arguments do not enable SMP."]
+configuration = ["Board-only publication selection mirrors the exact selected ArmCpu probe. Keep DT topology; detach and do not register ineligible service nubs. No busy-count manipulation, timeout change or new CPU/GIC/PSCI hardware operations."]
+procedure = ["Actual createNubs ARM branch and helper checked with host IOKit/topology/bootargs models; original-unfiltered and allow-all failures first, then production.", "Qualify current parent for mandatory storage binding guard, then formal CLI kernel, affected object-to-final calls and invariant hashes, unchanged H3W owner policy and image roundtrip."]
+findings = ["Native new publication counts, resolved CPU busy and subsequent heartbeat/boot state pending."]
+limits = ["This retains single-core policy, not SMP enablement or qualification. H3X boot-status remains RAM-only, not a physical PMU."]
+next = ["Capture cache-h3y cpu-policy eligible/withheld/invalid and the next native stop; preserve original busy monitoring."]
+
+[[area]]
+id = "smufs-cpu-provider-retain"
+status = "implemented"
+components = ["ArmDTPlatform", "ArmCpu", "XnuPrelink"]
+paths = ["patches/xnu/sm8250-h3z-cpu-provider-retain.patch"]
+inputs = ["H3Y user abort: FAR0/x0=0, PC suffix008ac79e4 maps to actual embedded IOPlatformDevice::compareName+0x28 (ldr x8,[x0] after getProvider). Caller is original device-tree-name query.", "UniXNU official drivers; GF88da12ad589eb80f116180822a52cfbdac76d115 patch0168 skips registration but does not detach the nub. Actual IORegistryEntry init transfers DT plane links to that nub."]
+configuration = ["Remove only H3Y's extra detach from the ineligible-CPU branch; retain provider and DT/service-plane ownership while skipping registerService. Existing selection policy is unchanged."]
+procedure = ["Actual createNubs ARM branch and original compareName, with independent DT/service references. H3Y reproduces NULL-provider dereference under ASAN/UBSAN; corrected branch passes the same name queries and publication matrix.", "Fresh parent binding guard, formal CLI kernel, relevant object-to-final calls and unchanged objects, policy and image readback."]
+findings = ["H3Y is a rejected native regression and must not be reflashed. H3Z native query/busy/heartbeat outcome pending."]
+limits = ["The exact queried node name was not captured; the observed NULL provider and H3Y extra detach identify the structural regression. Retains single-core policy and RAM-only boot-status."]
+next = ["Capture cache-h3z selection and boot output; check the original device-tree query and any next busy timeout."]
+
+[[area]]
+id = "sm8250-thermal-readonly-acquisition"
+status = "superseded"
+components = ["XnuPrelink"]
+paths = ["package/SmTsensReadOnly.cpp", "package/SmTsensReadOnly.h", "scripts/build-sm8250-thermal-observer.py", "patches/xnu/sm8250-h4a-thermal-readonly.patch"]
+inputs = ["H3Z user watchdog report: thermalmonitord missing38 sensors; six other services have repeated successful checkins over481s. No logo observed.", "Official drivers/power guides and GF fixed88da12ad original HID/watchdog integration read before implementation.", "Actual boot DTB SHA25674b114b184d6ba4125352b173f618e7ce235b3db459c34202fdb7135a9177dcb TSENS TM ranges0xc263000/0xc265000 size0x1ff; Android HEADcdeb8d4338100ba6891b5b3a49e49472776f3e11 kona.dtsi/tsens.h/tsens2xxx.c agree.", "Original21H461 thermalmonitord HidSensors consumes IOHIDServiceClientCopyEvent(type15), field0xf0000 in Celsius then multiplies100. The binary contains SMC paths too; strings alone do not establish which path was used."]
+configuration = ["Board qualification only: map both known TM ranges read-only, read TRDY/e4 and sixteen status/a0..dc registers at most twice separated10s; accept only ready-before/after and sample VALID. No recovery, secure calls, thresholds, interrupts or writes."]
+procedure = ["Actual acquisition/decoder ASAN/UBSAN host tests with explicit MMIO callback model: deliberate unsigned-decoding mutation fails, actual passes all4096 signed codes/read bounds/ready-loss/missing-valid cases.", "Actual target compile, formal CLI kernel, linked caller/readonly-load checks, unchanged watchdog/Data objects and payload readback before boot_a delivery."]
+findings = ["Only physical acquisition and immutable two-buffer reporting are implemented; two captures and retained mapping/timer live for this boot only. No Apple sensor identities or healthy checkins are manufactured."]
+limits = ["Native readiness/VALID/temperature not yet observed. Does not yet provide thermalmonitord HID sensor services or cure the current watchdog timeout; real PMIC/gauge channels and meaningful Apple-key board mapping remain to implement.", "CommCenter cause and OS display backend are separate unresolved work; original security/watchdog policies remain."]
+next = ["Read thermal-h4a phase3/samples2 and both tsens ready/valid/raw lines. Use actual readings plus the recovered HID matching/temperature contract to implement the sensor service."]
+
+[[area]]
+id = "sm8250-thermal-hid-service"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["package/SmTsensLiveCore.h", "package/SmTsensContinuous.cpp", "package/SmTsensTemperatureWire.h", "package/SmTsensTemperatureEvent.cpp", "package/SmTsensHid.cpp", "package/SmTsensHidState.h", "scripts/build-sm8250-thermal-hid.py", "patches/xnu/sm8250-h4c-thermal-hid.patch"]
+inputs = [
+ "H4B native second snapshot on the same board: TSENS0 valid ffff at27.3-31.1C and TSENS1 valid1ff at26.7-27.9C from the two TM ranges0xc263000/0xc265000 already qualified by the H4A acquisition area this one supersedes.",
+ "Pinned kernelcache f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7: IOHIDEventService metaclass0xfffffff007ae7090, instance vptr0xfffffff006d05e10,219 slots, size200, original withBytes0xfffffff005b01c90 (492 bytes) and type15 minimum event size20.",
+ "Original21H461 thermalmonitord calls IOHIDServiceClientCopyEvent(client,15,NULL,0) and reads float field0xf0000; it registers sensors by Product and LocationID copied from its Apple configuration.",
+ "Official UniXNU porting/drivers and porting/input pages: qualify the private ABI against the selected kernelcache, pair every work loop, timer and reference with its owner and release, keep class initialization consistent with the selected build's late registration.",
+]
+configuration = [
+ "Read only the two qualified TM ranges, republish both groups once per second with the measurement timestamp, and refuse reads that are absent, invalid, older than3s or precede the previous timestamp. No TSENS/PMIC writes, no recovery, no threshold or health-mask change.",
+ "Publish one endpoint per physical channel (group0/channel0, group1/channel0) as an original IOHIDEventService subclass: physical Product SM8250 TSENSg channelc, LocationID of its TM status register, PrimaryUsagePage0x20/Usage0x31. No Apple battery/PMIC/ACC identity is invented.",
+ "Defer the base class's publication request until start returns, preserve its option bits and publish synchronously; stop invalidates queries first and the board acquisition stays boot-owned.",
+]
+procedure = [
+ "Recover IOHIDEventService from the pinned kernelcache (constructor, metaclass, 219-slot vtable) and re-qualify the plan's single prelink slide, the whole IOHIDFamily __TEXT_EXEC hash and the 492 withBytes bytes in the builder; each inherited slot must still equal the current kernel's export.",
+ "Compile the three board sources with the target's real compile record, check all219 compiled vtable entries,55 original bindings and the bound addresses against the plan extents, then remove the automatic mod_init without changing any text byte.",
+ "Formal CLI kernel build, final-kernel audit of the same ABI, bindings, call sites and unchanged security objects, owner policy conversion, payload/bootimg round trip and a candidate strictly below the96MiB boot partition.",
+]
+findings = [
+ "Implementation complete and target-compiled; the final kernel audit, image build and user flash are the remaining steps, so no native endpoint, query count or thermalmonitord checkin is claimed here.",
+]
+limits = [
+ "thermalmonitord still registers the Apple Product/LocationID pairs; physical channel identities cannot satisfy those38 keys, and this area does not add battery, gauge or PMIC backends.",
+ "The acquisition timer and mappings are boot-lifetime; endpoints are created once from the first fresh snapshot and are not recreated after a channel loses VALID.",
+]
+next = [
+ "Read thermal-h4c live seq/tick plus hid step/created/query counters from the next panic screen, then decide whether an original user client can be shown to query slot201 with these identities.",
+]
+
+
+[[area]]
+id = "sm8250-thermal-wait-observer"
+status = "superseded"
+components = ["XnuPrelink"]
+paths = ["package/SmThermalWait*", "patches/xnu/sm8250-h4c-thermal-wait.patch"]
+inputs = ["R7 user live5: native original temperature events returned and released, no actual type15 client requests, thermalmonitord main dispatch queue unresponsive at483s.", "GF88da12ad589eb80f116180822a52cfbdac76d115 BACKBOARDD-USER-WAITS and patches0322-0324; actual selected XNU task/thread/map, main-thread tag and saved-state definitions.", "Original21H461 thermalmonitord SHA2568e94d7e0c48e8a9a1b9b0e3dbd3a8ed2b08b827b05134fed258c515cf9c96cec, LC_UUID1cd78bdbe0023b9481d84932f20dd086."]
+configuration = ["Separate LOW priority thread call: initial30s, missing-target retry15s, cap24 lookups and2 referenced-task captures, delay60s after a capture; exact thermalmonitord name and parent1 with actual UID; referenced task/map and at most32 referenced threads.", "Select main by THREAD_TAG_MAINTHREAD; capture saved state only WAIT without RUN, release all scheduler/thread/task locks before any user-map read. At most8 frames inside64KiB; refuse kernel maps, page faults and changed map/image metadata. Runtime UUID must match the pinned executable before walking.", "Print and preformat the latest sample in worker context; panic-only getter performs bounded atomic text copy plus the live-temperature summary. No target suspension, target-memory write, MMIO, health-mask or timeout modification."]
+procedure = ["Compile Mach observer and BSD process selector with their separate real native compile records, keeping private type checks enabled.", "Host checks extract actual capture/selection functions with explicit substitutes;7 deliberate broken guards must fail before production passes. Formal native linking, packaged getter/call audit and image round trip required before delivery."]
+findings = ["R8 native sample2 scanned only2 processes and selected no referenced task (iderr10). Its fixed two attempts start before PID1 original init exec and do not guarantee the target exists then. This does not identify the two processes or exclude a matched process without a task. R9 bounds discovery separately from captures, records match/pid even without task and preserves the last capture across misses. Native R9 waits and daemon recovery remain unobserved."]
+limits = ["Best-effort live saved state, not a suspended coherent task snapshot; thread-list truncation and frame read failures are reported. VM copies may fault; reads occur only in the LOW worker, never panic or scheduler-lock context.", "No complete thermalmonitord checkin, logo, battery/PMIC, CommCenter or persistent Data qualification is claimed."]
+next = ["Capture thermal-wait1 main PC/LR/frames with exec/cache UUID and slide; symbolize against the pinned actual images before choosing the next repair."]
+
+[[area]]
+id = "sm8250-thermal-wait-kernel"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["package/SmThermalWait.c", "package/SmThermalWaitProc.c", "package/SmThermalWaitBridge.h", "package/SmThermalWaitCore.h", "package/SmThermalWaitExpected.h", "package/SmGateTrace.c", "package/SmGateTrace.h", "drivers/Sm8250Ufs/Probe65Block.h", "drivers/Sm8250Ufs/RootWindowIo.h", "scripts/build-sm8250-thermal-hid.py", "patches/xnu/sm8250-h4c-thermal-wait.patch"]
+inputs = [
+ "r9 native sample: main-thread PC at the SystemConfiguration _dispatch_once import stub, state TH_WAIT without TH_RUN, done0 after a single publication.",
+ "GF fixed88da12ad blocked-kernel-stack observer (continuation==NULL, saved kernel state, no-fault frame reads), with this XNU's arm_kernel_saved_state_t and thread_get_kernel_state.",
+ "Local proc_getexecutableuuid and kern_proc.c declaration for a kernel-resident executable identity; arm_saved_state64 carries far/esr.",
+]
+configuration = [
+ "Observe only: retained task reference, up to32 thread references under task_lock, each thread inspected under splsched/thread_lock; no user-map read and no console write in the sampling or reschedule path; the normal worker formats its bounded text, while only the unsafe refusal and the panic getter are format-free.",
+ "Saved user state is copied with ml_nofault_copy and yields PC/LR/FP plus ESR/FAR. Kernel frames are read only when continuation==NULL and a full kernel stack exists: at most8 addresses inside the stack, 8-byte alignment, increasing fp, no-fault reads; every refusal has its own kstop code.",
+ "Phase and the last snapshot are separate publications so a phase update cannot erase a captured sample; the panic getter only performs bounded atomic copies of both plus the first live-temperature line.",
+]
+procedure = [
+ "Host checks run the real smtw_kernel_walk (10 cases) and the real panic getter with seven deliberate source mutations, each rejected; the schedule fixture asserts one poll number per callback and the select->capture->captured order.",
+ "Native-record compile, formal CLI kernel, final ARM audit of the linked text (boot caller, LOW priority, no copyinmap/printf/IOLog on the worker path, ml_nofault_copy and kernel_stack_size present, ESR/FAR in source), owner policy, payload/bootimg round trip, then a serial-bound flash.",
+]
+findings = ["R12 native tid372 waited at RootWindowBlock context gate; no holder or lock root cause was proven. R16 host checks reject a dropped transition and a newer loss after a previous publisher releases its claim; only a complete holder event can resynchronize. R16 runtime is pending.", "r10 native run reached the target, confirmed the kernel-resident UUID and the saved user state with ESR=SVC and FAR=0, and refused the kernel walk because the main thread is continuation-backed; the refusal code was refined for r11."]
+limits = ["Continuation-backed threads are refused by design, so their kernel stack is not traced; the executor identity is copied once in the BSD selector and re-checked only through task fields.", "Kernel addresses require the candidate's own exec base/slide/cache UUID at analysis time; no r9 ASLR values are reused."]
+next = ["R16: read the gate owner/stage or explicit invalid/unstable refusal from the new device run; a lost transition invalidates the snapshot until a complete holder event synchronizes its loss generation. This is observation only, not a storage-lock repair."]
+
+[[area]]
+id = "in2020-cpu1-cross-ipi"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461) C2-gic-readback USB serial unixnu-serial-20261110-134339-13132.log lines 210-212 and 281-290.",
+ "Selected XNU processor.h and sched_prim.h prototypes and linked cpu_to_processor, thread_bind and thread_block symbols.",
+ "Existing ArmCpu boot GICD_TYPER, IGROUPR0 and ISENABLER0 snapshots, redistributor readback and SGI0 sender.",
+]
+configuration = ["CPU0 and CPU1 only. After PSCI/entry/timer checks, move one diagnostic callout to CPU0, verify the sender MPIDR, send SGI0 once, then restore the prior thread binding."]
+procedure = ["Storage parent ABI audit, formal CLI kernel build and prelink, package against C2-gic-readback. Confirm only kernel.macho changes in the FAT payload."]
+findings = ["C2-gic-readback CPU1 PSCI returned 0, MPIDR 0x81000100 and timer +1117. SGI0 was sent from CPU1 itself and its receive counter stayed zero."]
+limits = ["The prior trial sampled pending before and after the send and did not observe pending SGI0. C2-cross-ipi is built and awaits hardware verification."]
+next = ["Require ARMCPU-P2X sent=1 from CPU0 and a positive CPU1 IPI receive delta. If no IPI arrives, qualify implemented INTID range and ownership before considering the ArmCpu SPI fallback."]
+
+[[area]]
+id = "in2020-cpu1-redist-ipi"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["drivers/ArmCpu/ArmCpu.cpp (shared component)", "package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461) C2-cross-ipi USB serial unixnu-serial-20261110-162543-61004.log lines 281-290. CPU0 sent SGI0 to CPU1, receive delta 0.",
+ "GICD_TYPER 0x007b041d, ITLinesNumber 29, ordinary INTID ceiling 959. Shared ArmCpu fallback uses 1008-1015.",
+ "Arm IHI0069 GICR_ISPENDR0 write-one-to-set behavior and the existing ArmCpu affinity-based redistributor frame lookup.",
+]
+configuration = ["One diagnostic write for SGI0 on the matching awake CPU1 frame, only if enabled and neither pending nor active. The normal signalCPU implementation stays in place."]
+procedure = ["Run parent storage ABI audit, CLI ArmCpu component and kernel build, prelink and image assembly against C2-cross-ipi. Confirm the FAT delta is kernel.macho."]
+findings = ["Cross-IPI attempt reproduced the self-SGI failure with the sender positively identified as CPU0. The ArmCpu SPI fallback IDs exceed the measured GIC range."]
+limits = ["Direct redistributor pending test is built and awaits IN2020 hardware verification."]
+next = ["Read ARMCPU-P2D on_boot, result, pending and the following CPU1 receive delta to separate register SGI generation from downstream IRQ delivery."]
+
+[[area]]
+id = "in2020-cpu1-runtime-ipi"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461), C2-redist-ipi serial lines 281-290. CPU0 wrote SGI0 pending on CPU1, read back 1, and CPU1 received one IPI.",
+ "Selected XNU osfmk/arm/cpu_common.c cpu_xcall and SIGPdisabled lifecycle; IOKit IOCPU dispatch through PE_cpu_signal.",
+]
+configuration = ["Keep CPU0 and CPU1 only. armcpu-redist-ipi=1 selects the target redistributor SGI0 path; armcpu-self-ipi=1 uses the existing boot self-IPI to activate XNU signaling."]
+procedure = ["CLI ArmCpu and native kernel build, prelink, FAT repack against C2-redist-ipi. Only the kernel and actual packed boot args may change."]
+findings = ["C2-redist-ipi verified the GICR_ISPENDR0 diagnostic path on the phone. Runtime candidate uses the redistributor address published by the target core setup."]
+limits = ["The runtime candidate needs both CPU0-to-CPU1 and CPU1-to-CPU0 callback evidence and a usable desktop. No root cause is inferred for the ICC_SGI1R_EL1 behavior."]
+next = ["Both ARMCPU-P2I records must have xcall_rc=0 and their reply_mpidr must match the actual target CPU. Keep further cores off until then."]
+
+[[area]]
+id = "in2020-p3-three-core"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["patches/xnu/sm8250-p3-three-core.patch", "package/SmGopDisplay.cpp"]
+inputs = [
+ "P3-cross-domain IN2020 iPadOS 17.7.11 (21H461) serial unixnu-serial-20261110-195648-113268.log lines 218-221, 281-285, 428. Physical CPU4 at affinity 0x400 brought up successfully with bidirectional IPI.",
+ "Prior C2-runtime-ipi native CPU0/CPU1 bidirectional xcalls; packed ADT ordering and XNU ml_parse_cpu_topology cpumask selection.",
+]
+configuration = ["Only physical CPU0/1/4. cpumask=0x13 and validated affinity-to-slot mapping allow logical slot 2 while keeping the prior single-secondary default."]
+procedure = ["Apply device XNU patch after P2, compile ArmCpu and native kernel, prelink and repack against P3-cross-domain. Re-read the packed mask and ADT order."]
+findings = ["The prior two-core cross-domain run completed about 30 minutes of capture with no kernel panic or backboardd watchdog observed."]
+limits = ["Three-core operation is pending device verification. Current XNU retains the four-slot capacity and one logical scheduler cluster."]
+next = ["Require two secondaries at step 7, two growing timer counters, all four xcall results, and an interactive desktop."]
+
+[[area]]
+id = "in2020-p3-four-core"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["patches/xnu/sm8250-p3-four-core.patch", "package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461) three-core serial unixnu-serial-20261110-210648-44312.log lines 211-222 and 289-295. CPU1 and CPU4 both booted with progressing timers and XNU xcalls in both directions with CPU0.",
+ "Factory merged DT cpu@700 reg 0x700, EPSS domain 2, and actual packed ADT node order."
+]
+configuration = ["Only physical CPU0/1/4/7. cpumask=0x93 plus verified logical mapping permits slots 1-3. Retain the four-slot compiled XNU and the existing scheduling, frequency and IPI policy."]
+procedure = ["Apply device XNU patch after the three-core patch, build ArmCpu and kernel, prelink and repack against P3-three-core. Re-read the packed mask and ADT order."]
+findings = ["The three-core run completed without a kernel panic. The first backboardd watchdog fired once and frames retired after restart."]
+limits = ["Four-core operation and hands-on touch are pending device verification. This is a single logical scheduler cluster across three hardware frequency domains."]
+next = ["Check CPU7 reset affinity/entry, three running secondaries, growing per-core timers and six XNU xcall replies, then confirm the desktop and touch."]
+
+[[area]]
+id = "in2020-p4-eight-slot-control"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["patches/xnu/sm8250-p4-eight-slot-control.patch"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461), serial unixnu-serial-20261110-212413-138032.log. All three secondaries ran, all six directional xcalls passed, and the touch driver submitted a real gesture.",
+ "Selected XNU BCM2837 board config, start.s reset scan, CpuDataEntries, CPUWINDOWS and pmap per-CPU array bounds."
+]
+configuration = ["Build with MAX_CPUS=8 and MAX_CPU_CLUSTERS=1. Preserve cpumask=0x93, all four active CPU identities, and all non-kernel payload inputs."]
+procedure = ["Build and prelink the kernel, inspect the compiled reset vector for a 0x80-byte scan retaining the Aff0/Aff1 mask, and replace only the parent image kernel."]
+findings = ["The four-active-core, four-slot control passed PSCI, per-CPU timers, six xcalls and touch report delivery; no kernel panic or backboardd watchdog in the capture."]
+limits = ["Runtime validation with larger kernel tables is pending. No change to E/P scheduling, power or frequencies."]
+next = ["Boot the eight-slot control with four active cores. Require all six callback results, desktop and touch before widening the active mask."]
+
+[[area]]
+id = "in2020-p4-five-core"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["patches/xnu/sm8250-p4-five-core.patch", "package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461), eight-slot-control serial unixnu-serial-20261110-215245-110180.log lines 297-306 and 447. The prior four active CPUs retained timers, xcalls and frame retirements with MAX_CPUS=8.",
+ "Factory merged DT cpu@600 reg 0x600 and EPSS domain 1. Packed ADT bit order preserves slots 0-2 and moves physical CPU7 from slot 3 to slot 4."
+]
+configuration = ["cpumask=0xd3, physical CPU0/1/4/6/7. Publish the fourth secondary only with the exact affinity map. Keep the eight-slot XNU, one scheduler cluster and existing IPI/power policy."]
+procedure = ["Apply the next device XNU patch, build and prelink, repack against the eight-slot control. Read back the actual mask and ADT order."]
+findings = ["The preceding eight-slot control passed the four-core CPU checks and still displayed frames. It recorded HID readiness without a gesture."]
+limits = ["Physical CPU6 and logical slot 4 remain to be tested on hardware."]
+next = ["Require four running secondaries, four growing timer counters, eight directional xcalls, and desktop and touch confirmation."]
+
+[[area]]
+id = "in2020-p4-five-core-timer"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461), five-core serial unixnu-serial-20261110-221240-35472.log lines 304-314. CPU7 ran in slot 4 and accepted SGIs, but its passive timer delta was zero and the old probe skipped its xcalls.",
+ "Selected XNU timer_call and timer_queue_assign implementation. ArmCpu INTID 27 counter is independent of SGI0."
+]
+configuration = ["Keep the same five physical CPUs and boot args. Issue xcalls independently of the passive timer sample. For a zero delta, enqueue one local deadline on that CPU and read the reply from CPU0."]
+procedure = ["Compile board probe, link with the selected XNU timer-call C ABI, prelink and repack against the five-core image. Only the kernel payload changes."]
+findings = ["The preceding five-core image reached frame retirements. CPU7 local timer and two explicit xcalls were not established by that run."]
+limits = ["Runtime results and hands-on touch are pending. A successful xcall is not counted as a timer test."]
+next = ["Check all eight directional xcalls, then require CPU7 passive PPI progress or a local deadline callback on CPU7 plus positive PPI count."]
+
+[[area]]
+id = "in2020-p4-six-core"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["patches/xnu/sm8250-p4-six-core.patch", "package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461), five-timer serial unixnu-serial-20261110-224709-70068.log lines 304-317. All eight cross-calls passed and CPU7 ran the local timer callback with PPI delta 1.",
+ "Factory merged DT cpu@500 reg 0x500 and EPSS domain 1; packed ADT bit order."
+]
+configuration = ["cpumask=0xf3 enables physical CPU0/1/4/5/6/7. Gate additional logical slots on the expected affinity map. Keep the eight-slot, single scheduler cluster and existing IPI and frequency policy."]
+procedure = ["Apply the device patch, build and prelink, repack against P4-five-timer. Confirm the actual mask, ADT order and unchanged boot chain."]
+findings = ["Five-core CPU qualification passed. The prior capture includes frame retirements and HID readiness without a gesture."]
+limits = ["Six-core operation and hands-on touch remain to be checked."]
+next = ["Require five running secondaries, per-core timer delivery, ten xcall replies at their target MPIDRs, desktop and touch."]
+
+[[area]]
+id = "in2020-p4-seven-core"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["patches/xnu/sm8250-p4-seven-core.patch", "package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461), six-core serial unixnu-serial-20261110-230945-124404.log lines 312-329. All ten xcalls passed. CPU5 and CPU6 local timers ran with PPI delta 1. Frame retirements and touch input followed the first backboardd watchdog restart.",
+ "Factory merged DT cpu@200 reg 0x200 and EPSS domain 0; packed ADT bit order."
+]
+configuration = ["cpumask=0xf7 enables physical CPU0/1/2/4/5/6/7. Gate the full six-secondary set on the exact affinity map. Keep XNU capacity, scheduler, frequency, IPI and timer policy."]
+procedure = ["Apply the device patch, build and prelink, repack against P4-six-core. Read back mask, ADT order and image hash."]
+findings = ["Six-core CPU qualification passed. The input capture shows a successful HID gesture and restored frame retirements after backboardd restarted."]
+limits = ["Seven-core operation and desktop responsiveness await device verification."]
+next = ["Require six running secondaries, per-core timer delivery, twelve xcall replies at their target MPIDRs, desktop and touch."]
+
+[[area]]
+id = "in2020-p4-eight-core"
+status = "implemented"
+components = ["ArmCpu"]
+paths = ["patches/xnu/sm8250-p4-eight-core.patch", "package/SmGopDisplay.cpp"]
+inputs = [
+ "IN2020 iPadOS 17.7.11 (21H461), seven-core serial unixnu-serial-20261110-232532-100308.log lines 317-336. Twelve xcalls passed and CPU7 local timer had PPI delta 1.",
+ "Factory merged DT cpu@300 reg 0x300 and EPSS domain 0, plus packed ADT order."
+]
+configuration = ["Use cpumask=0xff with an explicit affinity-to-slot check for all eight physical CPUs. Keep the existing one-cluster, eight-slot configuration and timer/IPI behavior."]
+procedure = ["Build and prelink; repack against P4-seven-core. Verify the final mask and ADT and report hardware separately."]
+findings = ["The seven-core run recorded a gesture and frame retirements after the first backboardd restarted."]
+limits = ["Eight-core operation awaits device verification. This is CPU activation, not E/P scheduler or frequency qualification."]
+next = ["Check seven secondary entries and per-core timers, fourteen directional xcalls, desktop and touch."]
+
+[[area]]
+id = "in2020-ipados-swipe-home"
+status = "implemented"
+components = ["ArmDTPlatform"]
+paths = ["board.toml"]
+inputs = [
+ "UniXNU MobileGestalt guide: ADT buttons node, hold/voldown/volup, little-endian u32 home-button-type 2.",
+ "The installed iPadOS 17.7.11 donor is iPad7,1/J120, pad. Apple's supported devices for this exact build have mechanical Home buttons.",
+ "Seven-core native baseline and verified factory RAM Data manifest, with no MobileGestalt cache files."
+]
+configuration = ["Advertise the actual board buttons and request swipe with home-button-type=2. Keep the existing iPadOS identity. Remove the synthetic boot Home argument from the gesture candidate."]
+procedure = ["Use the UniXNU format 2 ADT node encoder, merge only the buttons node into the pinned seven-core payload and repack with unixnu bootimg."]
+findings = ["Host packaging verified that only the buttons node and synthetic Home argument changed. The kernel and existing identity are inherited byte-for-byte."]
+limits = ["This tests the gesture property with the current supported donor identity; the full official Home-button-free Apple identity recipe uses a different donor. SpringBoard lock-screen behavior awaits hardware verification."]
+next = ["Check the About model and verify that a physical upward swipe on the lock screen enters the desktop or normal passcode prompt."]
+
+
+[[area]]
+id = "in2020-alert-slider-deferred-20261112"
+status = "implemented"
+components = []
+paths = ["package/In2020RingerService.h", "package/In2020RingerWire.h", "package/SmTsensHid.cpp", "scripts/build-sm8250-thermal-hid.py", "patches/xnu/sm8250-alert-slider-ringer.patch"]
+inputs = ["Exact iPadOS21H461 original IOHID keyboard factory and backboardd consumer contract; physical IST8801 pair and calibrated three-position traces."]
+configuration = ["Existing mode4 continuous classifier; upper/middle silent0, lower ring1. Native original keyboard-event factory. No new runtime configuration in this documentation round."]
+procedure = ["Retain the current implementation and record the failed UI acceptance. User explicitly deferred further ringer work on2026-11-12."]
+findings = ["Capture unixnu-serial-20261112-221649-97620.log SHA256 a4d580a7fd1ac027b6b838e3fbce147d11a25fce2bfc85ca881647212c3f7bb6: line530 factory=native, line767 initial matching query answered, lines976-1043 position changes and dispatch. User still reports no corresponding system mute-icon change. Manual Control Center mute was used, but its individual results are not established."]
+completion = ["NOT ACCEPTED: implemented means source integration only. System UI mute acceptance failed and remains unfinished."]
+limits = ["Void dispatch is not consumer acknowledgement. No vibration policy or read-fault recovery acceptance. MobileGestalt strings alone do not prove a capability gate."]
+next_action = ["DEFERRED BY USER. Do not resume automatically; see Windows workspace HANDOFF-IN2020-2026-11-12.md and UNFINISHED-IN2020.md. If resumed, inspect actual consumer subscription/filtering before changing capabilities."]
+evidence = [{ kind = "hardware", reference = "analysis/input-slider/ringer-receiver/deferred-result.json", result = "Physical classification and native-factory event production observed; user-facing mute acceptance failed, then explicitly deferred." }]

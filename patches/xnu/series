@@ -1,0 +1,101 @@
+# Board patch series, applied last, after the arch and SoC series.
+#
+# This replaces the OS profile's series rather than extending it. That series holds one
+# optional patch plus the two prelink patches; the optional one is dropped here:
+#
+#   zzz-boot-progress.patch patches the `#if XNU_SHENG_PMGR` block in bsd/kern/bsd_init.c
+#   that only the SM8550 SoC series inserts (sheng-platform-power.patch). On SM8250 that
+#   block does not exist, so the patch cannot apply. Boot progress is a framebuffer
+#   diagnostic overlay, and CONFIG_XNU_BOOT_PROGRESS is unset, so nothing links against it.
+#
+# The two prelink patches are required: XnuPrelink needs the security-init hook and the
+# sparse index.
+component:XnuPrelink/patches/xnu-10063.141.1-security-init.patch
+component:XnuPrelink/patches/xnu-10063.141.1-sparse-index.patch
+sm8250-root-trace.patch
+sm8250-h2-before-mount.patch
+sm8250-h3-authdiag.patch
+sm8250-h3b-owner-audit.patch
+sm8250-h3c-owner-accept.patch
+sm8250-h3d-init-diag.patch
+sm8250-h3f-user-svc.patch
+sm8250-h3g-mprotect-return.patch
+sm8250-h3h-user-resume.patch
+sm8250-h3j-cache-probe.patch
+sm8250-h3k-systemos-integrity.patch
+sm8250-h3l-cache-continue.patch
+sm8250-h3m-cache-carrier.patch
+sm8250-h3n-cache-io.patch
+sm8250-h3o-cache-stdio.patch
+sm8250-h3q-mount-output.patch
+sm8250-h3r-owner-bootset.patch
+sm8250-h3s-tz-symlink.patch
+sm8250-h3t-ram-data.patch
+sm8250-h3u-watchdog-brk.patch
+sm8250-h3v-watchdog-service.patch
+sm8250-h3w-watchdog-policy-observer.patch
+sm8250-h3x-boot-status.patch
+sm8250-h3y-cpu-publication.patch
+sm8250-h3z-cpu-provider-retain.patch
+sm8250-p2-single-secondary.patch
+sm8250-p2-reset-affinity.patch
+sm8250-p3-three-core.patch
+sm8250-p3-four-core.patch
+sm8250-p4-eight-slot-control.patch
+sm8250-p4-five-core.patch
+sm8250-p4-six-core.patch
+sm8250-p4-seven-core.patch
+sm8250-p4-eight-core.patch
+sm8250-h4c-thermal-hid.patch
+sm8250-h4c-thermal-wait.patch
+qcom-usb-debug-xnu10063.patch
+sm8250-gui-exit-r22.patch
+sm8250-cryptex-libraries-r23.patch
+sm8250-gui-trap-r24.patch
+sm8250-gui-chrono-r27.patch
+sm8250-gui-liveactivity-r28.patch
+sm8250-plugin-ipc-r30.patch
+sm8250-desktop-ipc-r31.patch
+sm8250-c2-screen-ipc.patch
+sm8250-c2-core-xpc.patch
+sm8250-c2-lsd-ipc.patch
+sm8250-pkd-exit-r32.patch
+sm8250-pkd-framework-r33.patch
+sm8250-fresh-key-state-r36.patch
+sm8250-setup-data-r37.patch
+sm8250-touch-probe-r38.patch
+sm8250-touch-power-r39.patch
+sm8250-touch-cmddb-r40.patch
+sm8250-touch-rails-r41.patch
+sm8250-touch-events-r42.patch
+sm8250-touch-hid-r43.patch
+sm8250-physical-keys-r46.patch
+sm8250-p6-gpio7-pull.patch
+sm8250-wallpaper-png-r47.patch
+sm8250-metal-addon-r59.patch
+sm8250-metal-compact-r60.patch
+sm8250-metal-settings-clients-r64.patch
+sm8250-ownerdata-512-r65.patch
+sm8250-metal-poster-clients-r66.patch
+sm8250-a650-revoke-cpu-mappings-r67.patch
+sm8250-a650-pager-ownership-r71.patch
+sm8250-metal-pipeline-addon-r72.patch
+sm8250-backboard-sdr-preference-r73.patch
+sm8250-backboard-linear-env-r74.patch
+
+sm8250-p4-edge-scheduler.patch
+sm8250-ownerdata-store.patch
+sm8250-ownerdata-key-state.patch
+sm8250-preferences-diag.patch
+sm8250-preferences-report.patch
+sm8250-iconservices-diag.patch
+sm8250-ownerdata-3g.patch
+sm8250-alert-slider-id.patch
+sm8250-alert-slider-power-id.patch
+sm8250-alert-slider-poll-id.patch
+sm8250-alert-slider-enable-id.patch
+sm8250-alert-slider-range-id.patch
+sm8250-alert-slider-samples.patch
+sm8250-alert-slider-position.patch
+sm8250-alert-slider-ringer.patch
+sm8250-metal-ownerdata.patch

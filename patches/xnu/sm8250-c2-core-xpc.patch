@@ -1,0 +1,106 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -127,8 +127,8 @@
+ extern int native_sm_gui_cache_identity(task_t, unsigned char *, uint32_t *);
+ extern int native_sm_gui_fault_state(uint64_t *, unsigned);
+ 
+-enum { PK30_MAX = 12, PK30_SLOTS_PER_KIND = 4, PK30_FRAMES = 24 };
+-enum pk31_kind { PK31_NONE, PK31_PLUGIN, PK31_ACTIVITY, PK31_SCREEN };
++enum { PK30_MAX = 16, PK30_SLOTS_PER_KIND = 4, PK30_FRAMES = 24 };
++enum pk31_kind { PK31_NONE, PK31_PLUGIN, PK31_ACTIVITY, PK31_SCREEN, PK31_CORE_SERVICES };
+ enum pk30_phase { PK30_REQUEST = 1, PK30_RECV, PK30_REPLY, PK30_DONE };
+ struct pk30_slot {
+ 	ipc_kmsg_t message;
+@@ -183,6 +183,9 @@
+ 	static const unsigned char chronod[16] = {
+ 		0x1a,0xb6,0xa2,0x83,0x69,0x5a,0x3e,0x4a,0xa3,0xd4,0x2e,0x7a,0xa2,0xf2,0xdd,0x42
+ 	};
++	static const unsigned char springboard[16] = {
++		0x97,0x49,0x8f,0x96,0xfa,0x26,0x38,0xc9,0xb5,0xe5,0xf8,0xa2,0xae,0x58,0x31,0x06
++	};
+ 	static const unsigned char cache[16] = {
+ 		0x59,0x0d,0x83,0x9a,0x82,0xd2,0x30,0xf1,0xa1,0x7d,0x0c,0xc0,0x53,0x42,0x0f,0x73
+ 	};
+@@ -192,19 +195,18 @@
+ 	uint32_t slide;
+ 	struct proc *proc;
+ 
+-	if (!(current_thread()->thread_tag & THREAD_TAG_MAINTHREAD)) {
+-		return false;
+-	}
+ 	proc_selfname(name, sizeof(name));
+-	if (strcmp(name, "chronod")) {
+-		return false;
++	const bool core_services = !strcmp(name, "SpringBoard");
++	if (!core_services && (strcmp(name, "chronod") ||
++	    !(current_thread()->thread_tag & THREAD_TAG_MAINTHREAD))) {
++		return PK31_NONE;
+ 	}
+ 	proc = get_bsdtask_info(current_task());
+ 	if (!proc) {
+ 		goto unavailable;
+ 	}
+ 	proc_getexecutableuuid(proc, uuid, sizeof(uuid));
+-	if (memcmp(uuid, chronod, sizeof(uuid)) ||
++	if (memcmp(uuid, core_services ? springboard : chronod, sizeof(uuid)) ||
+ 	    !native_sm_gui_cache_identity(current_task(), uuid, &slide) ||
+ 	    memcmp(uuid, cache, sizeof(uuid)) ||
+ 	    !native_sm_gui_fault_state(state, 15)) {
+@@ -212,6 +214,10 @@
+ 	}
+ 	const uint64_t plugin = 0x1b14199ccULL + slide;
+ 	const uint64_t activity = 0x21ca26a1cULL + slide;
++	/* Return sites from the four matching 21H461 T407 snapshots. */
++	const uint64_t core_inner = 0x187d68b5cULL + slide;
++	const uint64_t core_outer = 0x187cd3dd0ULL + slide;
++	bool seen_inner = false;
+ 	uint64_t frame = state[2], floor = state[3];
+ 	for (unsigned i = 0; i < PK30_FRAMES; i++) {
+ 		uint64_t pair[2];
+@@ -219,16 +225,26 @@
+ 		    frame > UINT64_MAX - sizeof(pair) || copyin(frame, pair, sizeof(pair))) {
+ 			break;
+ 		}
+-		if (pair[1] == plugin) {
+-			return PK31_PLUGIN;
+-		}
+-		if (pair[1] == activity) {
+-			return PK31_ACTIVITY;
++		if (core_services) {
++			seen_inner |= pair[1] == core_inner;
++			if (seen_inner && pair[1] == core_outer) {
++				return PK31_CORE_SERVICES;
++			}
++		} else {
++			if (pair[1] == plugin) {
++				return PK31_PLUGIN;
++			}
++			if (pair[1] == activity) {
++				return PK31_ACTIVITY;
++			}
+ 		}
+ 		if (pair[0] <= frame) {
+ 			break;
+ 		}
+ 		frame = pair[0];
++	}
++	if (core_services) {
++		return PK31_NONE;
+ 	}
+ unavailable:
+ 	unsigned misses = __atomic_add_fetch(&pk30_qual_fail, 1, __ATOMIC_RELAXED);
+@@ -405,11 +421,11 @@
+ 	if (IP_VALID(release)) {
+ 		ip_release(release);
+ 	}
+-	if (event.kind == PK31_SCREEN) {
++	if (event.kind == PK31_SCREEN || event.kind == PK31_CORE_SERVICES) {
+ 		char name[20] = {};
+ 		proc_selfname(name, sizeof(name));
+-		printf("SCREENIPC %s slot%u phase%u pid%d comm%s tid%llu status%x contention%u saturated%u\n",
+-		    received ? "receive" : "result", event.slot, event.phase,
++		printf("%s %s slot%u phase%u pid%d comm%s tid%llu status%x contention%u saturated%u\n",
++		    event.kind == PK31_CORE_SERVICES ? "COREXPC" : "SCREENIPC", received ? "receive" : "result", event.slot, event.phase,
+ 		    task_pid(current_task()), name, current_thread()->thread_id, (unsigned)status,
+ 		    __atomic_load_n(&pk30_contention, __ATOMIC_RELAXED),
+ 		    __atomic_load_n(&pk30_saturated, __ATOMIC_RELAXED));

@@ -1,0 +1,573 @@
+--- /dev/null
++++ b/bsd/dev/GeniI2c.c
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "GeniI2c.h"
++
++static uint32_t rd(GeniI2c *g, uint32_t reg) {return g->io.read(g->io.ctx, reg);}
++static void wr(GeniI2c *g, uint32_t reg, uint32_t value) {g->io.write(g->io.ctx, reg, value);}
++
++int geni_i2c_prepare(GeniI2c *g, const GeniIo *io, uint8_t address, uint32_t *config)
++{
++    for (unsigned i = 0; i < sizeof *g; ++i) ((uint8_t *)g)[i] = 0;
++    g->io = *io;
++    g->address = address;
++    const uint32_t proto = (rd(g, GENI_FW_REVISION) >> 8) & 0xffu, clock = rd(g, GENI_CLK_CFG);
++    if (config) *config = (proto << 24) | (clock & 0xffffffu);
++    if (proto != GENI_PROTO_I2C || (rd(g, GENI_IF_DISABLE) & 1u) || !(clock & 1u) || !rd(g, GENI_SCL_COUNTERS)) return -1;
++    wr(g, GENI_DMA_MODE, 0);
++    /* 8-bit words, 4 per FIFO word, least significant byte first on the wire. */
++    wr(g, GENI_TX_PACK0, 0x7f8fe); wr(g, GENI_TX_PACK1, 0xffefe);
++    wr(g, GENI_RX_PACK0, 0x7f8fe); wr(g, GENI_RX_PACK1, 0xffefe);
++    wr(g, GENI_BYTE_GRAN, 0);
++    wr(g, GENI_TX_WATERMARK, 0);
++    wr(g, GENI_M_IRQ_CLEAR, 0xffffffffu);
++    /* Exactly the bits this core handles: one the boot loader left enabled (RX watermark, RX last) would hold the level line up. */
++    wr(g, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED);
++    wr(g, GENI_SE_IRQ_EN, rd(g, GENI_SE_IRQ_EN) | GENI_SE_M_IRQ_EN);
++    return 0;
++}
++
++/* Starts one write command of length bytes (at most 8); the data goes in when the engine asks for it (TX watermark). */
++static void write_command(GeniI2c *g, const uint8_t *bytes, uint32_t length, int hold)
++{
++    g->tx[0] = g->tx[1] = 0;
++    for (uint32_t i = 0; i < length; ++i) g->tx[i / 4] |= (uint32_t)bytes[i] << (8 * (i % 4));
++    g->tx_words = (uint8_t)((length + 3) / 4);
++    g->length = length;
++    g->hold = (uint8_t)hold;
++    wr(g, GENI_TX_LEN, length);
++    wr(g, GENI_M_CMD0, (GENI_OP_WRITE << 27) | ((uint32_t)g->address << 9) | (hold ? GENI_STOP_STRETCH : 0));
++    wr(g, GENI_TX_WATERMARK, 1);
++    g->phase = GeniTxWait;
++}
++
++int geni_i2c_start_write(GeniI2c *g, uint8_t reg, uint8_t value)
++{
++    if (g->phase != GeniIdle) return -1;
++    g->reading = 0; g->reg = reg; g->value = value; g->error = GeniOk;
++    const uint8_t bytes[2] = {reg, value};
++    write_command(g, bytes, 2, 0);
++    return 0;
++}
++
++int geni_i2c_start_read(GeniI2c *g, uint8_t reg)
++{
++    if (g->phase != GeniIdle) return -1;
++    g->reading = 1; g->rx_length = 1; g->reg = reg; g->error = GeniOk;
++    write_command(g, &reg, 1, 1);
++    return 0;
++}
++
++int geni_i2c_start_write_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length)
++{
++    if (g->phase != GeniIdle || !length || length > 8) return -1;
++    g->reading = 0; g->error = GeniOk;
++    write_command(g, bytes, length, 0);
++    return 0;
++}
++
++int geni_i2c_start_read_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length, uint32_t read_length)
++{
++    if (g->phase != GeniIdle || !length || length > 4 || !read_length || read_length > 4) return -1;
++    g->reading = 1; g->rx_length = (uint8_t)read_length; g->error = GeniOk;
++    write_command(g, bytes, length, 1);
++    return 0;
++}
++
++static int finish(GeniI2c *g, int error, uint32_t status)
++{
++    g->phase = GeniIdle;
++    wr(g, GENI_TX_WATERMARK, 0);
++    if (!error) {g->done++; return GeniDone;}
++    g->error = (uint8_t)error;
++    g->error_status = status;
++    g->failed++;
++    return GeniFailed;
++}
++
++int geni_i2c_event(GeniI2c *g, uint32_t status)
++{
++    if (!status) return GeniPending;
++    switch (g->phase) {
++    case GeniIdle:
++        g->stray++;
++        return GeniPending;
++    case GeniCancelling:
++        if (status & GENI_M_CMD_CANCEL) return finish(g, GeniErrTimeout, g->error_status);
++        return GeniPending;
++    case GeniAborting:
++        if (status & GENI_M_CMD_ABORT) return finish(g, GeniErrTimeout, g->error_status);
++        return GeniPending;
++    default:
++        break;
++    }
++    /* A failed command also ends with CMD_DONE; the error bits decide. */
++    if (status & GENI_M_ERRORS) return finish(g, GeniErrBus, status);
++    if (g->phase == GeniTxWait) {
++        if (status & GENI_M_TX_WATERMARK) {
++            for (unsigned i = 0; i < g->tx_words; ++i) wr(g, GENI_TX_FIFO, g->tx[i]);
++            wr(g, GENI_TX_WATERMARK, 0);
++            g->phase = GeniWriteDone;
++        }
++        if (!(status & GENI_M_CMD_DONE)) return GeniPending;
++        if (g->phase == GeniTxWait) return finish(g, GeniErrState, status);  /* done before the data went in */
++    }
++    if (!(status & GENI_M_CMD_DONE)) return GeniPending;
++    if (g->phase == GeniWriteDone) {
++        if (!g->reading) return finish(g, GeniOk, 0);
++        wr(g, GENI_RX_LEN, g->rx_length);
++        wr(g, GENI_M_CMD0, (GENI_OP_READ << 27) | ((uint32_t)g->address << 9));
++        g->phase = GeniReadDone;
++        return GeniPending;
++    }
++    /* GeniReadDone */
++    if (!(rd(g, GENI_RX_FIFO_STATUS) & 0x1ffffffu)) return finish(g, GeniErrNoData, status);
++    g->rx = rd(g, GENI_RX_FIFO);
++    g->data = (uint8_t)g->rx;
++    return finish(g, GeniOk, 0);
++}
++
++int geni_i2c_poll(GeniI2c *g)
++{
++    const uint32_t status = rd(g, GENI_M_IRQ_STATUS);
++    if (status) wr(g, GENI_M_IRQ_CLEAR, status);
++    return g->phase == GeniIdle ? GeniPending : geni_i2c_event(g, status);
++}
++
++int geni_i2c_timeout(GeniI2c *g)
++{
++    switch (g->phase) {
++    case GeniIdle:
++        return GeniPending;
++    case GeniCancelling:
++        wr(g, GENI_M_CMD_CTRL, GENI_CMD_CTRL_ABORT);
++        g->phase = GeniAborting;
++        return GeniPending;
++    case GeniAborting:
++        return finish(g, GeniErrTimeout, g->error_status);
++    default:
++        g->timeouts++;
++        g->error_status = rd(g, GENI_M_IRQ_STATUS);
++        wr(g, GENI_TX_WATERMARK, 0);
++        wr(g, GENI_M_CMD_CTRL, GENI_CMD_CTRL_CANCEL);
++        g->phase = GeniCancelling;
++        return GeniPending;
++    }
++}
+--- /dev/null
++++ b/bsd/dev/GeniI2c.h
+@@ -0,0 +1,101 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* One register transfer at a time on a Qualcomm GENI serial engine running the I2C firmware, as an event-driven state machine: the owner
++ * starts a transfer, then feeds the engine's M_IRQ status (from its interrupt handler or a timer poll) until the transfer is done or
++ * failed, and calls the timeout step when its deadline passes. Nothing here waits or spins: every call does a few register accesses and
++ * returns. A register write is one 2-byte write {register, value}; a register read is a 1-byte write {register} that holds the stop
++ * condition, then a 1-byte read. A transfer that stops answering is cancelled, then aborted, as the engine documents. */
++#ifndef GENI_I2C_H
++#define GENI_I2C_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Serial engine registers (offsets in the engine's 16 KiB window). */
++#define GENI_FW_REVISION 0x68u
++#define GENI_IF_DISABLE 0x64u
++#define GENI_CLK_CFG 0x48u
++#define GENI_BYTE_GRAN 0x254u
++#define GENI_DMA_MODE 0x258u
++#define GENI_TX_PACK0 0x260u
++#define GENI_TX_PACK1 0x264u
++#define GENI_TX_LEN 0x26cu
++#define GENI_RX_LEN 0x270u
++#define GENI_SCL_COUNTERS 0x278u
++#define GENI_RX_PACK0 0x284u
++#define GENI_RX_PACK1 0x288u
++#define GENI_M_CMD0 0x600u
++#define GENI_M_CMD_CTRL 0x604u
++#define GENI_M_IRQ_STATUS 0x610u
++#define GENI_M_IRQ_EN 0x614u
++#define GENI_M_IRQ_CLEAR 0x618u
++#define GENI_TX_FIFO 0x700u
++#define GENI_RX_FIFO 0x780u
++#define GENI_RX_FIFO_STATUS 0x804u
++#define GENI_TX_WATERMARK 0x80cu
++#define GENI_SE_IRQ_EN 0xe1cu
++
++/* M_IRQ bits. */
++#define GENI_M_CMD_DONE (1u << 0)
++#define GENI_M_CMD_OVERRUN (1u << 1)
++#define GENI_M_ILLEGAL_CMD (1u << 2)
++#define GENI_M_CMD_FAILURE (1u << 3)
++#define GENI_M_CMD_CANCEL (1u << 4)
++#define GENI_M_CMD_ABORT (1u << 5)
++#define GENI_M_GP_IRQ (0x3fu << 9)      /* I2C: NACK, bus error, arbitration lost and the like */
++#define GENI_M_TX_WATERMARK (1u << 30)
++#define GENI_M_ERRORS (GENI_M_CMD_OVERRUN | GENI_M_ILLEGAL_CMD | GENI_M_CMD_FAILURE | GENI_M_GP_IRQ)
++/* What the engine is set to raise its line for. */
++#define GENI_M_IRQ_WANTED (GENI_M_CMD_DONE | GENI_M_ERRORS | GENI_M_CMD_CANCEL | GENI_M_CMD_ABORT | GENI_M_TX_WATERMARK)
++#define GENI_SE_M_IRQ_EN (1u << 2)
++#define GENI_CMD_CTRL_ABORT (1u << 1)
++#define GENI_CMD_CTRL_CANCEL (1u << 2)
++#define GENI_PROTO_I2C 3u
++#define GENI_OP_WRITE 1u
++#define GENI_OP_READ 2u
++#define GENI_STOP_STRETCH (1u << 2)
++
++typedef struct {
++    uint32_t (*read)(void *ctx, uint32_t reg);
++    void (*write)(void *ctx, uint32_t reg, uint32_t value);
++    void *ctx;
++} GeniIo;
++
++enum {GeniIdle, GeniTxWait, GeniWriteDone, GeniReadDone, GeniCancelling, GeniAborting};
++enum {GeniPending = 0, GeniDone = 1, GeniFailed = 2};
++/* Why the last transfer failed. */
++enum {GeniOk = 0, GeniErrBusy = 1, GeniErrBus = 2, GeniErrTimeout = 3, GeniErrNoData = 4, GeniErrState = 5};
++
++typedef struct {
++    GeniIo io;
++    uint8_t address, phase, reading, hold;
++    uint8_t reg, value, error, data;
++    uint8_t tx_words, rx_length;
++    uint32_t tx[2], length;
++    uint32_t rx;                     /* the bytes read, first byte in bits 7:0 */
++    uint32_t error_status;           /* the M_IRQ status of the last failure */
++    uint32_t done, failed, timeouts, stray;
++} GeniI2c;
++
++/* Checks the engine runs the I2C firmware with its clock and timing set (the boot loader's), selects FIFO mode with 8-bit packing and
++ * enables the interrupts this core needs. Returns 0, or -1 when the engine is not usable. *config: proto << 24 | M_CLK_CFG bits 23:0. */
++int geni_i2c_prepare(GeniI2c *g, const GeniIo *io, uint8_t address, uint32_t *config);
++int geni_i2c_start_write(GeniI2c *g, uint8_t reg, uint8_t value);
++int geni_i2c_start_read(GeniI2c *g, uint8_t reg);
++/* Multi-byte forms for devices with wider registers: write 1..8 bytes; or write 1..4 bytes (holding the stop condition), then read 1..4
++ * bytes into g->rx. */
++int geni_i2c_start_write_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length);
++int geni_i2c_start_read_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length, uint32_t read_length);
++/* Feeds M_IRQ status bits (already cleared by whoever read them). Returns GeniPending, GeniDone (read value in g->data) or GeniFailed. */
++int geni_i2c_event(GeniI2c *g, uint32_t status);
++/* Reads and clears the status itself, then as geni_i2c_event (for a timer poll; the interrupt handler does the same in its context). */
++int geni_i2c_poll(GeniI2c *g);
++/* The owner's deadline for the current step passed: a pending transfer is cancelled, a cancel that is not acknowledged is aborted and an
++ * abort that is not acknowledged ends the transfer anyway. Returns as geni_i2c_event. */
++int geni_i2c_timeout(GeniI2c *g);
++static inline int geni_i2c_busy(const GeniI2c *g) {return g->phase != GeniIdle;}
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/Sm8250TouchBoard.c
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <vm/memory_types.h>
++
++#include "Sm8250TouchProbe.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t physical, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t address, vm_size_t size);
++extern void thread_terminate_self(void);
++
++/* Stock IN2020 DTB, Qualcomm SM8250 GCC and TLMM register layouts. */
++enum {
++    GccBranchPage = 0x00118000,
++    GccVotePage = 0x00150000,
++    GccWrap1Vote = 0x2008,
++    GccWrap1M_Ahb = 0x004,
++    GccWrap1S_Ahb = 0x008,
++    GccWrap1S5 = 0x5fc,
++    GccVotesRequired = (1 << 20) | (1 << 21) | (1 << 27),
++    TlmmGpio36Page = 0x0f524000,
++    TlmmPinStride = 0x1000,
++    TlmmMuxMask = 0xf << 2,
++    TlmmQup13 = 1 << 2,
++    TlmmOutputEnable = 1 << 9,
++    TlmmData = 4,
++    TlmmInputHigh = 1,
++    TlmmOutputHigh = 2,
++    Se13Page = 0x00a94000,
++    WindowSize = 0x4000,
++};
++
++static uint32_t
++read_reg(void *window, uint32_t offset)
++{
++    return *(volatile uint32_t *)((uintptr_t)window + offset);
++}
++
++static void
++write_reg(void *window, uint32_t offset, uint32_t value)
++{
++    *(volatile uint32_t *)((uintptr_t)window + offset) = value;
++    __asm__ volatile("dmb oshst" ::: "memory");
++}
++
++static vm_offset_t
++map_window(vm_offset_t physical)
++{
++    return ml_io_map_unmappable(physical, WindowSize, VM_WIMG_IO);
++}
++
++static bool
++clocks_ready(void)
++{
++    vm_offset_t branches = map_window(GccBranchPage);
++    vm_offset_t votes = map_window(GccVotePage);
++    bool ready = false;
++    if (branches && votes) {
++        uint32_t ma = read_reg((void *)branches, GccWrap1M_Ahb);
++        uint32_t sa = read_reg((void *)branches, GccWrap1S_Ahb);
++        uint32_t se = read_reg((void *)branches, GccWrap1S5);
++        uint32_t vote = read_reg((void *)votes, GccWrap1Vote);
++        ready = !((ma | sa | se) & (1u << 31)) &&
++            (vote & GccVotesRequired) == GccVotesRequired;
++        printf("TOUCH38 clocks ready=%u vote=%x m=%x s=%x se=%x\n", ready, vote, ma, sa, se);
++    } else {
++        printf("TOUCH38 clocks mapping failed\n");
++    }
++    if (votes) {
++        ml_io_unmap(votes, WindowSize);
++    }
++    if (branches) {
++        ml_io_unmap(branches, WindowSize);
++    }
++    return ready;
++}
++
++static bool
++pins_ready(void)
++{
++    vm_offset_t pins = map_window(TlmmGpio36Page);
++    if (!pins) {
++        printf("TOUCH38 pins mapping failed\n");
++        return false;
++    }
++    uint32_t config[4], data[4];
++    for (unsigned pin = 0; pin < 4; ++pin) {
++        config[pin] = read_reg((void *)pins, pin * TlmmPinStride);
++        data[pin] = read_reg((void *)pins, pin * TlmmPinStride + TlmmData);
++    }
++    ml_io_unmap(pins, WindowSize);
++    bool ready = (config[0] & TlmmMuxMask) == TlmmQup13 &&
++        (config[1] & TlmmMuxMask) == TlmmQup13 &&
++        (config[2] & (TlmmMuxMask | TlmmOutputEnable)) == TlmmOutputEnable &&
++        (data[2] & TlmmOutputHigh) &&
++        (data[0] & data[1] & TlmmInputHigh);
++    printf("TOUCH38 pins ready=%u sda=%x/%x scl=%x/%x reset=%x/%x irq=%x/%x\n",
++        ready, config[0], data[0], config[1], data[1], config[2], data[2], config[3], data[3]);
++    return ready;
++}
++
++static void
++probe_once(void)
++{
++    bool clocks = clocks_ready();
++    bool pins = pins_ready();
++    if (!clocks || !pins) {
++        printf("TOUCH38 skipped clocks=%u pins=%u\n", clocks, pins);
++        return;
++    }
++
++    vm_offset_t engine = map_window(Se13Page);
++    if (!engine) {
++        printf("TOUCH38 engine mapping failed\n");
++        return;
++    }
++    printf("TOUCH38 examining SE13 at 0x%x\n", Se13Page);
++    const GeniIo io = {read_reg, write_reg, (void *)engine};
++    Sm8250TouchResult chip;
++    int status = sm8250_touch_read_chip(&io, delay, &chip);
++    printf("TOUCH38 result=%d config=%x reg=%02x boot=%02x integrity=%02x error=%d irq=%x\n",
++        status, chip.config, chip.reg, chip.boot, chip.integrity, chip.error, chip.irq_status);
++    ml_io_unmap(engine, WindowSize);
++}
++
++static void
++probe_thread(void *unused, wait_result_t result)
++{
++    (void)unused;
++    (void)result;
++    probe_once();
++    thread_terminate_self();
++}
++
++void sm8250_touch_probe_start(void);
++
++void
++sm8250_touch_probe_start(void)
++{
++    int enabled = 0;
++    if (!PE_parse_boot_argn("sm8250-touch-probe", &enabled, sizeof(enabled)) || enabled != 1) {
++        return;
++    }
++    thread_t worker;
++    kern_return_t status = kernel_thread_start(probe_thread, NULL, &worker);
++    if (status == KERN_SUCCESS) {
++        thread_deallocate(worker);
++    } else {
++        printf("TOUCH38 cannot start probe thread: %d\n", status);
++    }
++}
+--- /dev/null
++++ b/bsd/dev/Sm8250TouchProbe.c
+@@ -0,0 +1,101 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "Sm8250TouchProbe.h"
++
++enum {
++    GeniStatus = 0x40,
++    GeniCommandActive = (1 << 0) | (1 << 12),
++    GeniTxFifoStatus = 0x800,
++    GeniGsiEventEnable = 0xe18,
++    SensorAddress = 0x48,
++    SensorBootStatus = 0x55,
++    SensorFirmwareIntegrity = 0x21,
++};
++
++static void
++poll_write(void *context, uint32_t reg, uint32_t value)
++{
++    const GeniIo *io = context;
++    /* The firmware left the master IRQ unrouted. Poll the status instead. */
++    if (reg != GENI_SE_IRQ_EN) {
++        io->write(io->ctx, reg, value);
++    }
++}
++
++static uint32_t
++poll_read(void *context, uint32_t reg)
++{
++    const GeniIo *io = context;
++    return io->read(io->ctx, reg);
++}
++
++static int
++read_byte(GeniI2c *bus, void (*wait_us)(int), uint8_t reg, uint8_t *byte)
++{
++    if (geni_i2c_start_read(bus, reg) != 0) {
++        return GeniFailed;
++    }
++    /* One transfer window, followed by bounded cancel and abort windows. */
++    for (unsigned window = 0; window < 3; ++window) {
++        for (unsigned elapsed = 0; elapsed < 20000; elapsed += 10) {
++            int state = geni_i2c_poll(bus);
++            if (state != GeniPending) {
++                if (state == GeniDone) {
++                    *byte = bus->data;
++                }
++                return state;
++            }
++            wait_us(10);
++        }
++        geni_i2c_timeout(bus);
++    }
++    return GeniFailed;
++}
++
++int
++sm8250_touch_read_chip(const GeniIo *io, void (*wait_us)(int), Sm8250TouchResult *result)
++{
++    *result = (Sm8250TouchResult){0};
++    if ((io->read(io->ctx, GeniStatus) & GeniCommandActive) ||
++        (io->read(io->ctx, GENI_SE_IRQ_EN) & GENI_SE_M_IRQ_EN) ||
++        io->read(io->ctx, GeniGsiEventEnable) ||
++        io->read(io->ctx, GENI_M_IRQ_STATUS) ||
++        (io->read(io->ctx, GeniTxFifoStatus) & 0xfffffffu) ||
++        (io->read(io->ctx, GENI_RX_FIFO_STATUS) & 0x1ffffffu) ||
++        io->read(io->ctx, GENI_TX_WATERMARK)) {
++        return SmTouchEngineBusy;
++    }
++
++    /* Save the controller configuration changed by the upstream polling core. */
++    static const uint32_t configuration[] = {
++        GENI_DMA_MODE, GENI_TX_PACK0, GENI_TX_PACK1, GENI_RX_PACK0,
++        GENI_RX_PACK1, GENI_BYTE_GRAN, GENI_TX_LEN, GENI_RX_LEN, GENI_M_IRQ_EN,
++    };
++    uint32_t saved[sizeof(configuration) / sizeof(configuration[0])];
++    for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); ++i) {
++        saved[i] = io->read(io->ctx, configuration[i]);
++    }
++
++    GeniI2c bus;
++    const GeniIo polling = {poll_read, poll_write, (void *)io};
++    if (geni_i2c_prepare(&bus, &polling, SensorAddress, &result->config) != 0) {
++        return SmTouchEngineUnavailable;
++    }
++    result->reg = SensorBootStatus;
++    int state = read_byte(&bus, wait_us, result->reg, &result->boot);
++    if (state == GeniDone) {
++        if (io->read(io->ctx, GeniStatus) & GeniCommandActive) {
++            return SmTouchEngineStillActive;
++        }
++        result->reg = SensorFirmwareIntegrity;
++        state = read_byte(&bus, wait_us, result->reg, &result->integrity);
++    }
++    result->error = bus.error;
++    result->irq_status = bus.error_status;
++    if (io->read(io->ctx, GeniStatus) & GeniCommandActive) {
++        return SmTouchEngineStillActive;
++    }
++    for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); ++i) {
++        io->write(io->ctx, configuration[i], saved[i]);
++    }
++    return state == GeniDone ? SmTouchReadComplete : SmTouchTransferFailed;
++}
+--- /dev/null
++++ b/bsd/dev/Sm8250TouchProbe.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#ifndef SM8250_TOUCH_PROBE_H
++#define SM8250_TOUCH_PROBE_H
++
++#include "GeniI2c.h"
++
++typedef struct {
++    uint32_t config;
++    uint32_t irq_status;
++    int error;
++    uint8_t reg;
++    uint8_t boot;
++    uint8_t integrity;
++} Sm8250TouchResult;
++
++enum {
++    SmTouchReadComplete,
++    SmTouchEngineUnavailable,
++    SmTouchEngineBusy,
++    SmTouchTransferFailed,
++    SmTouchEngineStillActive,
++};
++
++int sm8250_touch_read_chip(const GeniIo *io, void (*wait_us)(int), Sm8250TouchResult *result);
++
++#endif
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -609,3 +609,6 @@
+ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
++bsd/dev/GeniI2c.c		standard
++bsd/dev/Sm8250TouchBoard.c		standard
++bsd/dev/Sm8250TouchProbe.c		standard
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -2543,6 +2543,10 @@
+ 	extern void native_legacy_display_late_probe(void);
+ 	native_legacy_display_late_probe();
+ #endif
++	if (result == KERN_SUCCESS) {
++		extern void sm8250_touch_probe_start(void);
++		sm8250_touch_probe_start();
++	}
+ 	return result;
+ }
+ 

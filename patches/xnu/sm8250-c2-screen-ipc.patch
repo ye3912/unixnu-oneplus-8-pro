@@ -1,0 +1,76 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -127,8 +127,8 @@
+ extern int native_sm_gui_cache_identity(task_t, unsigned char *, uint32_t *);
+ extern int native_sm_gui_fault_state(uint64_t *, unsigned);
+ 
+-enum { PK30_MAX = 8, PK30_FRAMES = 24 };
+-enum pk31_kind { PK31_NONE, PK31_PLUGIN, PK31_ACTIVITY };
++enum { PK30_MAX = 12, PK30_SLOTS_PER_KIND = 4, PK30_FRAMES = 24 };
++enum pk31_kind { PK31_NONE, PK31_PLUGIN, PK31_ACTIVITY, PK31_SCREEN };
+ enum pk30_phase { PK30_REQUEST = 1, PK30_RECV, PK30_REPLY, PK30_DONE };
+ struct pk30_slot {
+ 	ipc_kmsg_t message;
+@@ -236,6 +236,26 @@
+ 		printf("PKIPC31 qualifier miss%u pid%d\n", misses, task_pid(current_task()));
+ 	}
+ 	return false;
++}
++
++/* 21H461 BackBoardServices __BKSDisplayGetMainScreenInfo. Match only the
++ * original SpringBoard executable and its main thread. No payload is read. */
++static bool
++pk31_screen_request(mach_msg_id_t msgid)
++{
++	static const unsigned char springboard[16] = {
++		0x97,0x49,0x8f,0x96,0xfa,0x26,0x38,0xc9,0xb5,0xe5,0xf8,0xa2,0xae,0x58,0x31,0x06
++	};
++	if (msgid != 0x5b9173 || !(current_thread()->thread_tag & THREAD_TAG_MAINTHREAD)) {
++		return false;
++	}
++	struct proc *proc = get_bsdtask_info(current_task());
++	unsigned char uuid[16] = {};
++	if (!proc) {
++		return false;
++	}
++	proc_getexecutableuuid(proc, uuid, sizeof(uuid));
++	return memcmp(uuid, springboard, sizeof(uuid)) == 0;
+ }
+ 
+ struct pk31_owner {
+@@ -288,14 +308,14 @@
+ 	enum pk31_kind kind = PK31_NONE;
+ 	if (MACH_MSGH_BITS_LOCAL(bits) == MACH_MSG_TYPE_PORT_SEND_ONCE &&
+ 	    IP_VALID(reply) && IP_VALID(dest)) {
+-		kind = pk30_match();
++		kind = pk31_screen_request(msgid) ? PK31_SCREEN : pk30_match();
+ 	}
+ 	if (kind != PK31_NONE) {
+ 		ip_reference(reply);
+ 		if (pk30_enter()) {
+-			/* Reserve half the trace for each call site. Slots are never reused. */
+-			unsigned index = kind == PK31_PLUGIN ? 0 : PK30_MAX / 2;
+-			unsigned end = index + PK30_MAX / 2;
++			/* Preserve the previous per-kind budget. Slots are never reused. */
++			unsigned index = ((unsigned)kind - 1) * PK30_SLOTS_PER_KIND;
++			unsigned end = index + PK30_SLOTS_PER_KIND;
+ 			while (index < end && pk30_slots[index].kind != PK31_NONE) {
+ 				index++;
+ 			}
+@@ -384,6 +404,16 @@
+ 	}
+ 	if (IP_VALID(release)) {
+ 		ip_release(release);
++	}
++	if (event.kind == PK31_SCREEN) {
++		char name[20] = {};
++		proc_selfname(name, sizeof(name));
++		printf("SCREENIPC %s slot%u phase%u pid%d comm%s tid%llu status%x contention%u saturated%u\n",
++		    received ? "receive" : "result", event.slot, event.phase,
++		    task_pid(current_task()), name, current_thread()->thread_id, (unsigned)status,
++		    __atomic_load_n(&pk30_contention, __ATOMIC_RELAXED),
++		    __atomic_load_n(&pk30_saturated, __ATOMIC_RELAXED));
++		return;
+ 	}
+ 	if (received && event.phase == PK30_REQUEST && status == MACH_MSG_SUCCESS) {
+ 		static const unsigned char pkd[16] = {

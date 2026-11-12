@@ -1,0 +1,118 @@
+{
+  "baseline": "R1: device accepted; tearing absent and stutter clearly improved",
+  "os": "iPadOS 17.7.11 / 21H461",
+  "image_sha256": "493568fd555fda131014d45d023346cc4e867cec10d04ef78842c688266a4965",
+  "native_kernel_sha256": "bf0c1eb4b50de9a7f8061d0e227813d0d66daa40b443f1e6347e7c57b5c24c9a",
+  "core_revision": "5d6136f0380aae8ffb7094af0d36935eb13d6f11",
+  "core_tracked_diff_sha256": "07283f4a98d1dc26165a4cf062ca1df2ab8f14bb018d3de315bdc9b2e52d4b11",
+  "core_modules": [
+    {
+      "path": "drivers/Adreno740",
+      "revision": "5c8c1453c67d6ef6b10ec43ab1f8fc570a2f33e1",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/AdrenoMetal",
+      "revision": "ce5e19e33e05e1873d38d818e23cabfe0ac708c3",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/AppleKeyStoreState",
+      "revision": "42ff83e08b2265fe741d4adaf084bebe003452ba",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/ArmCpu",
+      "revision": "9066b53bbc82e92a98ec44a11dd50fd13eaf1a1b",
+      "tracked_local_diff_sha256": "80411cefd2fbad36bc97865907ac40d1bcc58a6ef362550de6c9b73b47de7059"
+    },
+    {
+      "path": "drivers/ArmDTPlatform",
+      "revision": "417ff95d6a6e8607ddea9309ec45c3bfd4a67c60",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/ArmVirtPlatform",
+      "revision": "d1423a8bceac4be0478a93d9173587111c040084",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/DarwinBoot",
+      "revision": "3325e352d7df68a9f9ad74832ed94a6acbbd7390",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/GopFramebuffer",
+      "revision": "33e941a878dcf01b98dbd9160d798bd56e7551ea",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/QcomGeniSpi",
+      "revision": "eac47baefe6a5d2368a70351e6ad1b6361bedbe2",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/RamBlock",
+      "revision": "25c57e0e9b68bf452dd1986914525edc9d2320bc",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/SoftwareAES",
+      "revision": "4a45326da5c2cd6fe6813d79ee43db20805628af",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/VirtioMmioBlock",
+      "revision": "8ee3a5ab5a3726b0641990228346aec338246eaf",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "drivers/VirtioMmioConsole",
+      "revision": "70253216890b2afcaa6333948726f896f84fc757",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "kits/AdrenoFirmware",
+      "revision": "20ad3d7aca14bd46aecab6335c780f5413fa054b",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "kits/AdrenoPM4",
+      "revision": "282606b528b2595bc4274ea7490b62b323f35a5f",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "kits/AirNir",
+      "revision": "b356371a74cd158c2902f4886f373ebb0f833a36",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "kits/ArmSmmu4K",
+      "revision": "3ba92451bd44bb742d11758fbfcd3a446ecad685",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "kits/VerifiedRoot",
+      "revision": "def026642c6c6e71be0dea267d989df1d29ddc64",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "kits/XnuPrelink",
+      "revision": "f876e3ee62e18fc06653dd75ed7dafcfb3950ac0",
+      "tracked_local_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "a650_reference_revision": "bdee54c393c938455c9c8626946fa5c376ea3d45",
+  "gop_reference": "file snapshot: support/gop-r20; not a standalone Git checkout",
+  "uefi": {
+    "repository": "https://github.com/Project-Silicium/Mu-Silicium.git",
+    "revision": "d4007bf56a9155d99507e5a0e29213ada9a9652a"
+  },
+  "r2_included": false,
+  "binaries_included": false,
+  "limitations": [
+    "External firmware, IPSW/kernelcache, owner policy/key and Data inputs are intentionally absent.",
+    "R72 addon is identified by artifact hash/CDHashes; original remote build provenance is not fully recovered.",
+    "This source export is not a fresh clean-machine build verification."
+  ]
+}

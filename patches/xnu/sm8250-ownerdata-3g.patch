@@ -1,0 +1,22 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1305,8 +1305,8 @@
+  */
+ extern int native_ram_block_volume_seed(const char *,dev_t *,char *,size_t,uint64_t *,uint64_t *,uint8_t[32]);
+ extern volatile uint32_t native_data_persist_state;
+-static const char smufs_data_uuid[]="9507ACA8-9C67-4595-8A8B-114F8A595FBE";
+-static const uint8_t smufs_data_expected_hash[32]={0xe8,0xd9,0x5a,0x60,0x19,0x30,0xaa,0xdc,0xc2,0x72,0x42,0xf7,0x1c,0xec,0xb0,0x74,0x13,0x34,0xe9,0xa0,0x72,0xb0,0x1a,0x11,0xee,0xb1,0x44,0x47,0xaa,0x78,0x52,0x6a};
++static const char smufs_data_uuid[]="606295FD-BED4-4FC1-A347-E0344DC75C15";
++static const uint8_t smufs_data_expected_hash[32]={0xef,0x2c,0xf0,0xcf,0xe3,0x7c,0x82,0xcb,0xb4,0x13,0xd1,0x3a,0xd5,0xa6,0x15,0x04,0x00,0xbe,0x60,0x69,0x0d,0x14,0xb0,0xfb,0x7b,0xf7,0x6f,0xca,0x7a,0x6a,0xcf,0x69};
+ static struct {
+  uint32_t stage,selected,mounted,readonly,apfs,seed_ok,rebound,root_same,path_bound;
+  uint32_t mount_enter,mount_return;
+@@ -1349,7 +1349,7 @@
+     uint32_t os_device,uint32_t system_device)
+ {
+  return device!=0xffffffffU && device!=os_device && device!=system_device &&
+-        bytes==UINT64_C(536870912) && !memcmp(hash,smufs_data_expected_hash,32);
++        bytes==UINT64_C(3221225472) && !memcmp(hash,smufs_data_expected_hash,32);
+ }
+ 
+ __attribute__((noinline)) static const char *

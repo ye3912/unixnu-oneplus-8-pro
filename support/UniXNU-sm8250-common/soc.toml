@@ -1,0 +1,11 @@
+schema_version = 2
+
+[soc]
+name = "sm8250"
+description = "Qualcomm SM8250 (kona)"
+# Hardware data for every value below comes from the device's own kernel tree.
+source_repository = "OnePlus 8 series ColorOS 16 kernel (sm8250)"
+source_revision = "coloros16_sm8250_kernel-android16"
+
+[components]
+include = ["ArmCpu", "ArmDTPlatform"]

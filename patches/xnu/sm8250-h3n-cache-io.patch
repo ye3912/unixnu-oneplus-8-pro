@@ -1,0 +1,267 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -930,16 +930,131 @@
+  if(error){int zero=0;(void)__atomic_compare_exchange_n(&smufs_cache_carrier.first_map_error,&zero,error,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED);}
+  __atomic_add_fetch(&smufs_cache_carrier.map_return,1U,__ATOMIC_RELEASE);
+ }
++/* H3N observes only PID1 after verified preparation. No I/O result is changed. */
++static struct {
++ uint32_t lock,dropped,opens,closed;
++ struct {int dirfd,fd,error,copy_error;uint32_t returned;char path[128];} open[32];
++ uint32_t reads,stats,sig_enter,sig_return;int read_fd,read_error,stat_fd,stat_error,sig_fd,sig_error,sig_first;
++ int64_t read_bytes,stat_size,sig_covered;uint64_t read_wanted,read_offset;
++ char scratch[320],pending[320],dyld_error[240],ignition[96];uint32_t pending_bytes;int pending_fd;
++} smufs_cache_io;
++__attribute__((noinline)) int
++native_smufs_cache_io_enabled(void)
++{return __atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE)&&proc_getpid(current_proc())==1;}
++static uint32_t smufs_cache_io_lock(void)
++{
++ if(!native_smufs_cache_io_enabled())return 0;
++ if(__atomic_exchange_n(&smufs_cache_io.lock,1U,__ATOMIC_ACQUIRE)){
++  __atomic_add_fetch(&smufs_cache_io.dropped,1U,__ATOMIC_RELAXED);return 0;}
++ return 1;
++}
++static void smufs_cache_io_unlock(void){__atomic_store_n(&smufs_cache_io.lock,0U,__ATOMIC_RELEASE);}
++__attribute__((noinline)) uint32_t
++native_smufs_cache_open_begin(int dirfd,uint64_t path)
++{
++ if(!smufs_cache_io_lock())return 0;
++ uint32_t ticket=++smufs_cache_io.opens;
++ if(ticket>32){smufs_cache_io_unlock();return 0;}
++ uint32_t i=ticket-1;size_t copied=0;
++ smufs_cache_io.open[i].dirfd=dirfd;smufs_cache_io.open[i].fd=-1;
++ smufs_cache_io.open[i].copy_error=copyinstr(path,smufs_cache_io.open[i].path,sizeof(smufs_cache_io.open[i].path),&copied);
++ smufs_cache_io.open[i].path[sizeof(smufs_cache_io.open[i].path)-1]=0;
++ smufs_cache_io_unlock();return ticket;
++}
++__attribute__((noinline)) void
++native_smufs_cache_open_end(uint32_t ticket,int error,int fd)
++{
++ if(!ticket||ticket>32||!smufs_cache_io_lock())return;
++ uint32_t i=ticket-1;smufs_cache_io.open[i].error=error;smufs_cache_io.open[i].fd=error?-1:fd;
++ smufs_cache_io.open[i].returned=1;++smufs_cache_io.closed;smufs_cache_io_unlock();
++}
++__attribute__((noinline)) void
++native_smufs_cache_io_result(uint32_t op,int fd,int error,int64_t value,uint64_t wanted,uint64_t offset)
++{
++ if(!smufs_cache_io_lock())return;
++ if(op==1){++smufs_cache_io.reads;smufs_cache_io.read_fd=fd;smufs_cache_io.read_error=error;
++  smufs_cache_io.read_bytes=value;smufs_cache_io.read_wanted=wanted;smufs_cache_io.read_offset=offset;}
++ if(op==2){++smufs_cache_io.stats;smufs_cache_io.stat_fd=fd;smufs_cache_io.stat_error=error;smufs_cache_io.stat_size=value;}
++ smufs_cache_io_unlock();
++}
++__attribute__((noinline)) void
++native_smufs_cache_signature(uint32_t returning,int fd,int error,uint64_t user_arg)
++{
++ if(!smufs_cache_io_lock())return;
++ if(!returning){++smufs_cache_io.sig_enter;smufs_cache_io_unlock();return;}
++ ++smufs_cache_io.sig_return;smufs_cache_io.sig_fd=fd;smufs_cache_io.sig_error=error;
++ if(error&&!smufs_cache_io.sig_first)smufs_cache_io.sig_first=error;
++ int64_t covered=-1;
++ if(!error)(void)copyin(user_arg,&covered,sizeof(covered));
++ smufs_cache_io.sig_covered=covered;smufs_cache_io_unlock();
++}
++__attribute__((noinline)) static void
++smufs_cache_console_line(void)
++{
++ smufs_cache_io.pending[smufs_cache_io.pending_bytes]=0;
++ if(!smufs_cache_io.dyld_error[0]&&(strnstr(smufs_cache_io.pending,"dyld cache",sizeof(smufs_cache_io.pending))||strnstr(smufs_cache_io.pending,"shared cache",sizeof(smufs_cache_io.pending))))
++  strlcpy(smufs_cache_io.dyld_error,smufs_cache_io.pending,sizeof(smufs_cache_io.dyld_error));
++ if(!smufs_cache_io.ignition[0]&&(strnstr(smufs_cache_io.pending,"ignite()",sizeof(smufs_cache_io.pending))||strnstr(smufs_cache_io.pending,"ignition",sizeof(smufs_cache_io.pending))))
++  strlcpy(smufs_cache_io.ignition,smufs_cache_io.pending,sizeof(smufs_cache_io.ignition));
++ smufs_cache_io.pending_bytes=0;
++}
++__attribute__((noinline)) void
++native_smufs_cache_console(int fd,uint64_t address,uint64_t bytes)
++{
++ if(!bytes||!smufs_cache_io_lock())return;
++ size_t n=bytes<sizeof(smufs_cache_io.scratch)-1?(size_t)bytes:sizeof(smufs_cache_io.scratch)-1;
++ if(!copyin(address,smufs_cache_io.scratch,n)){
++  if(smufs_cache_io.pending_bytes&&fd!=smufs_cache_io.pending_fd)smufs_cache_console_line();
++  smufs_cache_io.pending_fd=fd;
++  for(size_t i=0;i<n;++i){
++   char c=smufs_cache_io.scratch[i];
++   if(!c||c=='\n'){smufs_cache_console_line();continue;}
++   if(smufs_cache_io.pending_bytes==sizeof(smufs_cache_io.pending)-1)smufs_cache_console_line();
++   smufs_cache_io.pending[smufs_cache_io.pending_bytes++]=c;
++  }
++ }
++ smufs_cache_io_unlock();
++}
++__attribute__((noinline)) static const char *
++smufs_cache_io_note(void)
++{
++ static char note[736];
++ if(!smufs_cache_io_lock())return "IO trace unavailable\n";
++ uint32_t limit=smufs_cache_io.opens<32?smufs_cache_io.opens:32;int directory=-1,cache=-1,last=-1;
++ for(uint32_t i=0;i<limit;++i){
++  if(!smufs_cache_io.open[i].returned)continue;
++  last=(int)i;
++  if(directory<0&&strnstr(smufs_cache_io.open[i].path,"com.apple.dyld",sizeof(smufs_cache_io.open[i].path))&&!strnstr(smufs_cache_io.open[i].path,"dyld_shared_cache",sizeof(smufs_cache_io.open[i].path)))directory=(int)i;
++  if(cache<0&&strnstr(smufs_cache_io.open[i].path,"dyld_shared_cache",sizeof(smufs_cache_io.open[i].path)))cache=(int)i;
++ }
++ if(directory<0)directory=last;
++ const char *dp=directory<0?"<none>":smufs_cache_io.open[directory].path;
++ const char *cp=cache<0?"<none>":smufs_cache_io.open[cache].path;
++ snprintf(note,sizeof(note),"open %u/%u kept%u drop%u\nD %.80s d%d f%d e%d c%d\nC %.80s d%d f%d e%d c%d\n"
++     "stat %u f%d e%d size%lld\npread %u f%d e%d n%lld/%llu off%llx\nsig %u/%u f%d e%d first%d cover%lld\n%.220s\n%.80s\n",
++     smufs_cache_io.opens,smufs_cache_io.closed,limit,__atomic_load_n(&smufs_cache_io.dropped,__ATOMIC_RELAXED),
++     dp,directory<0?-1:smufs_cache_io.open[directory].dirfd,directory<0?-1:smufs_cache_io.open[directory].fd,
++     directory<0?-1:smufs_cache_io.open[directory].error,directory<0?-1:smufs_cache_io.open[directory].copy_error,
++     cp,cache<0?-1:smufs_cache_io.open[cache].dirfd,cache<0?-1:smufs_cache_io.open[cache].fd,
++     cache<0?-1:smufs_cache_io.open[cache].error,cache<0?-1:smufs_cache_io.open[cache].copy_error,
++     smufs_cache_io.stats,smufs_cache_io.stat_fd,smufs_cache_io.stat_error,(long long)smufs_cache_io.stat_size,
++     smufs_cache_io.reads,smufs_cache_io.read_fd,smufs_cache_io.read_error,(long long)smufs_cache_io.read_bytes,
++     (unsigned long long)smufs_cache_io.read_wanted,(unsigned long long)smufs_cache_io.read_offset,
++     smufs_cache_io.sig_enter,smufs_cache_io.sig_return,smufs_cache_io.sig_fd,smufs_cache_io.sig_error,smufs_cache_io.sig_first,
++     (long long)smufs_cache_io.sig_covered,smufs_cache_io.dyld_error,smufs_cache_io.ignition);
++ smufs_cache_io_unlock();return note;
++}
++
+ __attribute__((noinline)) const char *
+ native_smufs_cache_panic_note(void)
+ {
+- static char note[224];
++ static char note[944];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3m prep1 carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n",
++ snprintf(note,sizeof(note),"SMUFS cache-h3n prep1 carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s",
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED));
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),smufs_cache_io_note());
+  return note;
+ }
+ 
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -28,6 +28,12 @@
+ uint32_t native_smufs_init_mprotect_enter(uint64_t addr,uint64_t len,int32_t prot);
+ void native_smufs_init_mprotect_return(int32_t error);
+ void native_smufs_init_user_svc(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr);
++int native_smufs_cache_io_enabled(void);
++uint32_t native_smufs_cache_open_begin(int dirfd,uint64_t path);
++void native_smufs_cache_open_end(uint32_t ticket,int error,int fd);
++void native_smufs_cache_io_result(uint32_t op,int fd,int error,int64_t value,uint64_t wanted,uint64_t offset);
++void native_smufs_cache_signature(uint32_t returning,int fd,int error,uint64_t user_arg);
++void native_smufs_cache_console(int fd,uint64_t address,uint64_t bytes);
+ struct vnode;
+ int native_smufs_cache_carrier(struct vnode *process_root,struct vnode *file);
+ void native_smufs_cache_map_event(uint32_t returning,int error);
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -73,6 +73,7 @@
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/smufs_init_trace.h>
+ #include <sys/namei.h>
+ #include <sys/filedesc.h>
+ #include <sys/kernel.h>
+@@ -5132,16 +5133,22 @@
+ open_nocancel(__unused proc_t p, struct open_nocancel_args *uap,
+     int32_t *retval)
+ {
+-	return openat_internal(vfs_context_current(), uap->path, uap->flags,
++	uint32_t smufs_ticket=native_smufs_cache_open_begin(AT_FDCWD,uap->path);
++	int smufs_error = openat_internal(vfs_context_current(), uap->path, uap->flags,
+ 	           uap->mode, AT_FDCWD, UIO_USERSPACE, retval);
++	native_smufs_cache_open_end(smufs_ticket,smufs_error,smufs_error?-1:*retval);
++	return smufs_error;
+ }
+ 
+ int
+ openat_nocancel(__unused proc_t p, struct openat_nocancel_args *uap,
+     int32_t *retval)
+ {
+-	return openat_internal(vfs_context_current(), uap->path, uap->flags,
++	uint32_t smufs_ticket=native_smufs_cache_open_begin(uap->fd,uap->path);
++	int smufs_error = openat_internal(vfs_context_current(), uap->path, uap->flags,
+ 	           uap->mode, uap->fd, UIO_USERSPACE, retval);
++	native_smufs_cache_open_end(smufs_ticket,smufs_error,smufs_error?-1:*retval);
++	return smufs_error;
+ }
+ 
+ int
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -74,6 +74,7 @@
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/smufs_init_trace.h>
+ #include <sys/filedesc.h>
+ #include <sys/kernel.h>
+ #include <sys/vnode_internal.h>
+@@ -2740,8 +2741,8 @@
+ 	return sys_fcntl_outdrop(p, fd, fp, vp, error);
+ }
+ 
+-int
+-sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
++__attribute__((noinline)) static int
++smufs_fcntl_impl(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ {
+ 	int fd = uap->fd;
+ 	int cmd = uap->cmd;
+@@ -5300,6 +5301,15 @@
+ }
+ 
+ 
++int
++sys_fcntl_nocancel(proc_t p,struct fcntl_nocancel_args *uap,int32_t *retval)
++{
++ if(uap->cmd==F_ADDFILESIGS_RETURN)native_smufs_cache_signature(0,uap->fd,0,uap->arg);
++ int error=smufs_fcntl_impl(p,uap,retval);
++ if(uap->cmd==F_ADDFILESIGS_RETURN)native_smufs_cache_signature(1,uap->fd,error,uap->arg);
++ return error;
++}
++
+ /*
+  * sys_close
+  *
+@@ -5617,7 +5627,11 @@
+ int
+ sys_fstat64(proc_t p, struct fstat64_args *uap, __unused int32_t *retval)
+ {
+-	return fstat(p, uap->fd, uap->ub, 0, 0, 1);
++	int error=fstat(p, uap->fd, uap->ub, 0, 0, 1);
++	int64_t size=-1;
++	if(!error&&native_smufs_cache_io_enabled())(void)copyin(uap->ub+offsetof(struct user64_stat64,st_size),&size,sizeof(size));
++	native_smufs_cache_io_result(2,uap->fd,error,size,0,0);
++	return error;
+ }
+ 
+ 
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -74,6 +74,7 @@
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/smufs_init_trace.h>
+ #include <sys/filedesc.h>
+ #include <sys/ioctl.h>
+ #include <sys/file_internal.h>
+@@ -398,8 +399,10 @@
+ 	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_SC_EXTENDED_INFO, SYS_pread) | DBG_FUNC_NONE),
+ 	    uap->fd, uap->nbyte, (unsigned int)((uap->offset >> 32)), (unsigned int)(uap->offset), 0);
+ 
+-	return read_internal(p, uap->fd, uap->buf, uap->nbyte, uap->offset,
++	int smufs_error = read_internal(p, uap->fd, uap->buf, uap->nbyte, uap->offset,
+ 	           FOF_OFFSET, retval);
++	native_smufs_cache_io_result(1,uap->fd,smufs_error,smufs_error?-1:*retval,uap->nbyte,uap->offset);
++	return smufs_error;
+ }
+ 
+ /*
+@@ -699,6 +702,7 @@
+ int
+ write_nocancel(struct proc *p, struct write_nocancel_args *uap, user_ssize_t *retval)
+ {
++	native_smufs_cache_console(uap->fd,uap->cbuf,uap->nbyte);
+ 	return write_internal(p, uap->fd, uap->cbuf, uap->nbyte, (off_t)-1, 0,
+ 	           NULL, retval);
+ }

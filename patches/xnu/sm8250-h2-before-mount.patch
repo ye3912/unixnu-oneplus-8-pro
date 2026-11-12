@@ -1,0 +1,30 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1041,6 +1041,27 @@
+ 		native_smufs_root_trace_emit(SMRT_SETCONF_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 		setconf();
+ 		native_smufs_root_trace_emit(SMRT_SETCONF_RETURN, 0, SMRT_FLAGS, 0, rootdev != NODEV, (uint32_t)rootdev);
++		/* H2-only diagnostic boundary: retain standard root selection and stop
++		 * before vfs_mountroot. Disabled on ordinary boots. No auth bypass. */
++		uint32_t smufs_h2_match_only = 0;
++		if (PE_parse_boot_argn("native-ufs-root-match-only", &smufs_h2_match_only,
++		    sizeof(smufs_h2_match_only)) && smufs_h2_match_only) {
++			static SmUfsRootTraceSnapshot smufs_h2_snapshot;
++			uint32_t coherent = native_smufs_root_trace_snapshot(&smufs_h2_snapshot);
++			const SmUfsRootTraceRecord *r = smufs_h2_snapshot.records;
++			panic("SMUFS root-h2 before-mount root=%s dev=%x flags=%x\n"
++			      "trace en%u coherent%u partial%u lost%u writes%u\n"
++			      "find%u/%u match%u inputs%x wait%u/%u present%d\n"
++			      "selected%u valid%u dev%x props%x mount%u/%u\n",
++			      rootdevice, (uint32_t)rootdev, (uint32_t)r[SMRT_SELECTED].result, smufs_h2_snapshot.enabled, coherent,
++			      smufs_h2_snapshot.partial, smufs_h2_snapshot.lost, smufs_h2_snapshot.writes,
++			      r[SMRT_FIND_ENTER].count, r[SMRT_FIND_RETURN].count, r[SMRT_MATCH_SOURCE].arg,
++			      r[SMRT_INPUTS].arg, r[SMRT_ROOT_WAIT_ENTER].count, r[SMRT_ROOT_WAIT_RETURN].count,
++			      r[SMRT_ROOT_WAIT_RETURN].result, r[SMRT_SELECTED].count,
++			      r[SMRT_SELECTED].dev_valid, r[SMRT_SELECTED].dev, r[SMRT_BSD_PROPERTIES].arg,
++			      r[SMRT_MOUNT_ENTER].count, r[SMRT_MOUNT_RETURN].count);
++		}
++
+ #if CONFIG_NETBOOT
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif

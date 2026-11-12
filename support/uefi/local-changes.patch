@@ -1,0 +1,148 @@
+diff --git a/Platforms/OnePlus/instantnoodlepPkg/Include/DXE.inc b/Platforms/OnePlus/instantnoodlepPkg/Include/DXE.inc
+index 80f6cf1..01fac97 100644
+--- a/Platforms/OnePlus/instantnoodlepPkg/Include/DXE.inc
++++ b/Platforms/OnePlus/instantnoodlepPkg/Include/DXE.inc
+@@ -142,5 +142,3 @@ FILE FREEFORM = DDE58710-41CD-4306-DBFB-3FA90BB1D2DD {
+ # Boot menu application; BDS starts it through the option UniXNUDxe registers.
+ INF UniXNUPkg/Application/UniXNU/UniXNU.inf
+   # Open-source UFS stack (adapter first, then pass-thru, SCSI bus and disk).
+-  INF instantnoodlepPkg/Drivers/QcomUfsDxe/QcomUfsDxe.inf
+-  INF MdeModulePkg/Bus/Ufs/UfsPassThruDxe/UfsPassThruDxe.inf
+diff --git a/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.dsc b/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.dsc
+index c5ad463..3edf546 100644
+--- a/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.dsc
++++ b/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.dsc
+@@ -98,6 +98,9 @@
+   # variable services keep their store in RAM. Persistence returns with storage.
+   #
+   gEfiMdeModulePkgTokenSpaceGuid.PcdEmuVariableNvModeEnable|TRUE
++  # This firmware volume includes UniXNU but omits MsBootPolicy and UFPLoader.
++  gSiliciumPkgTokenSpaceGuid.PcdRegisterStorageAndFfuBootOptions|FALSE
++
+   gUniXNUPkgTokenSpaceGuid.PcdUniXNUDeviceModel|"instantnoodlep"
+   gAdvLoggerPkgTokenSpaceGuid.PcdAdvancedLoggerPages|256
+ 
+@@ -112,6 +115,8 @@
+   # QCOM Libraries
+   #
+   ConfigurationMapLib|instantnoodlepPkg/Library/ConfigurationMapLib/ConfigurationMapLib.inf
++  # This firmware volume omits the Qualcomm MassStorage application.
++  PlatformBootOptionsLib|SiliciumNullPkg/Library/PlatformBootOptionsLibNull/PlatformBootOptionsLibNull.inf
+ 
+   #
+   # UniXNU and DarwinBoot
+@@ -168,5 +173,3 @@
+   # Open-source UFS stack: the Qualcomm adapter keeps the link ABL left behind and
+   # EDK2's UfsPassThru performs the fDeviceInit query the vendor binary omits.
+   #
+-  instantnoodlepPkg/Drivers/QcomUfsDxe/QcomUfsDxe.inf
+-  MdeModulePkg/Bus/Ufs/UfsPassThruDxe/UfsPassThruDxe.inf
+diff --git a/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.fdf b/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.fdf
+index 79c7a0c..9e4d649 100644
+--- a/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.fdf
++++ b/Platforms/OnePlus/instantnoodlepPkg/instantnoodlep.fdf
+@@ -86,7 +86,13 @@ READ_LOCK_STATUS   = TRUE
+ 
+   # UniXNU: payload volume publisher, loader protocol and boot menu
+ 
+-  # !include QcomPkg/Extra.fdf.inc
++  INF MdeModulePkg/Universal/Acpi/BootGraphicsResourceTableDxe/BootGraphicsResourceTableDxe.inf
++  INF MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenuApp.inf
++
++  FILE FREEFORM = PCD (gOemPkgTokenSpaceGuid.PcdLogoFile) {
++    SECTION RAW = SiliciumPkg/Include/Resources/BootLogo.bmp
++    SECTION UI = "BootLogo.bmp"
++  }
+ 
+   INF UniXNUPkg/Driver/AdvancedLogDxe/AdvancedLogDxe.inf
+ 
+diff --git a/Silicon/Qualcomm/QcomPkg/Library/SmBiosTableLib/SmBiosTable.c b/Silicon/Qualcomm/QcomPkg/Library/SmBiosTableLib/SmBiosTable.c
+index 1a8268b..325ede9 100644
+--- a/Silicon/Qualcomm/QcomPkg/Library/SmBiosTableLib/SmBiosTable.c
++++ b/Silicon/Qualcomm/QcomPkg/Library/SmBiosTableLib/SmBiosTable.c
+@@ -3,6 +3,7 @@
+ #include <Library/MemoryAllocationLib.h>
+ #include <Library/PrintLib.h>
+ #include <Library/BaseLib.h>
++#include <Library/PcdLib.h>
+ 
+ #include "SmBiosTable.h"
+ 
+@@ -82,6 +83,16 @@ PlatformUpdateSmBiosType17 (IN OUT EFI_SMBIOS_TYPE17 *Type17)
+     Type17->Strings[2] = ConvertManufacturerId (ManufacturerId);
+   }
+ 
++  // Boards with an unsafe DDR speed protocol publish unknown SMBIOS speeds.
++  if (FixedPcdGetBool (PcdFaultyDdrProtocol)) {
++    Type17->Table.Speed                              = 0;
++    Type17->Table.ExtendedSpeed                      = 0;
++    Type17->Table.ConfiguredMemoryClockSpeed         = 0;
++    Type17->Table.ExtendedConfiguredMemorySpeed = 0;
++    DEBUG ((DEBUG_INFO, "%a: DDR speeds unknown (disabled by platform policy)\n", __FUNCTION__));
++    return;
++  }
++
+   // Get DDR Speed
+   Status = GetDdrSpeeds (&MaxSpeed, &CurrentSpeed);
+   if (EFI_ERROR (Status)) {
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.c b/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.c
+index 5cc415e..227f18b 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.c
+@@ -132,7 +132,7 @@ CreateFvBootOption (
+   // Read EFI Application Section
+   Status = mFv2Protocol->ReadSection (mFv2Protocol, FileGuid, EFI_SECTION_PE32, 0, &Buffer, &Size, &AuthenticationStatus);
+   if (EFI_ERROR (Status)) {
+-    DEBUG ((EFI_D_ERROR, "%a: Failed to Read EFI Application Section from %a! Status = %r\n", __FUNCTION__, FileGuid, Status));
++    DEBUG ((EFI_D_ERROR, "%a: Failed to Read EFI Application Section from %g! Status = %r\n", __FUNCTION__, FileGuid, Status));
+     return Status;
+   }
+ 
+@@ -150,7 +150,7 @@ CreateFvBootOption (
+   // Init Boot Option
+   Status = EfiBootManagerInitializeLoadOption (BootOption, LoadOptionNumberUnassigned, LoadOptionTypeBoot, Attributes, Description, DevicePath, OptionalData, OptionalDataSize);
+   if (EFI_ERROR (Status)) {
+-    DEBUG ((EFI_D_ERROR, "%a: Failed to Init Boot Option for %a! Status = %r\n", __FUNCTION__, FileGuid, Status));
++    DEBUG ((EFI_D_ERROR, "%a: Failed to Init Boot Option for %g! Status = %r\n", __FUNCTION__, FileGuid, Status));
+ 
+     // Free Buffers
+     FreePool (Buffer);
+@@ -243,9 +243,11 @@ MsBootOptionsLibRegisterDefaultBootOptions ()
+   UINT8                     BootOptionCount;
+ 
+   // Register Default Boot Options
+-  RegisterFvBootOption (&gMsBootPolicyFileGuid,            L"Internal Storage", (UINTN)-1, LOAD_OPTION_ACTIVE, (UINT8 *)"SSD", sizeof ("SSD"));
+-  RegisterFvBootOption (&gMsBootPolicyFileGuid,            L"USB Storage",      (UINTN)-1, LOAD_OPTION_ACTIVE, (UINT8 *)"USB", sizeof ("USB"));
+-  RegisterFvBootOption (FixedPcdGetPtr (PcdUfpLoaderFile), L"FFU Mode",         (UINTN)-1, LOAD_OPTION_HIDDEN, NULL, 0);
++  if (FixedPcdGetBool (PcdRegisterStorageAndFfuBootOptions)) {
++    RegisterFvBootOption (&gMsBootPolicyFileGuid,            L"Internal Storage", (UINTN)-1, LOAD_OPTION_ACTIVE, (UINT8 *)"SSD", sizeof ("SSD"));
++    RegisterFvBootOption (&gMsBootPolicyFileGuid,            L"USB Storage",      (UINTN)-1, LOAD_OPTION_ACTIVE, (UINT8 *)"USB", sizeof ("USB"));
++    RegisterFvBootOption (FixedPcdGetPtr (PcdUfpLoaderFile), L"FFU Mode",         (UINTN)-1, LOAD_OPTION_HIDDEN, NULL, 0);
++  }
+ 
+   // Get Platform Boot Options
+   GetPlatformBootOptions (&BootOption, &BootOptionCount);
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.inf b/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.inf
+index ead26b5..483c293 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.inf
++++ b/Silicon/Silicium/SiliciumPkg/Library/MsBootOptionsLib/MsBootOptionsLib.inf
+@@ -40,6 +40,7 @@
+ 
+ [FixedPcd]
+   gSiliciumPkgTokenSpaceGuid.PcdUfpLoaderFile
++  gSiliciumPkgTokenSpaceGuid.PcdRegisterStorageAndFfuBootOptions
+ 
+ [Pcd]
+   gEfiMdeModulePkgTokenSpaceGuid.PcdBootManagerMenuFile
+diff --git a/Silicon/Silicium/SiliciumPkg/SiliciumPkg.dec b/Silicon/Silicium/SiliciumPkg/SiliciumPkg.dec
+index 99cd697..d7c1b6f 100644
+--- a/Silicon/Silicium/SiliciumPkg/SiliciumPkg.dec
++++ b/Silicon/Silicium/SiliciumPkg/SiliciumPkg.dec
+@@ -43,6 +43,7 @@
+   #
+   gSiliciumPkgTokenSpaceGuid.PcdUfpLoaderFile|{ 0x97, 0x0C, 0x68, 0xCC, 0xCE, 0x94, 0x09, 0x4C, 0xA3, 0x77, 0x4B, 0xED, 0x5E, 0x6E, 0x9C, 0xB9 }|VOID*|0x0000A300
+   gSiliciumPkgTokenSpaceGuid.PcdUfpDeviveFwFile|{ 0x88, 0x47, 0x3D, 0x64, 0xC8, 0x63, 0xD2, 0x40, 0xBD, 0x7A, 0x68, 0x42, 0xE6, 0x68, 0x50, 0xD1 }|VOID*|0x0000A301
++  gSiliciumPkgTokenSpaceGuid.PcdRegisterStorageAndFfuBootOptions|TRUE|BOOLEAN|0x0000A302
+ 
+   #
+   # RAW Files

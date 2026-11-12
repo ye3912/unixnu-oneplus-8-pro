@@ -1,0 +1,62 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1734,30 +1734,22 @@
+     uint32_t mode = 0;
+     PE_parse_boot_argn("sm8250-gpu-alioth", &mode, sizeof(mode));
+     const bool metal = mode == 12;
+-    const uint64_t wallpaper_bytes = 10637096;
++    const uint64_t addon_bytes = metal ? 18639392 : 10637096;
++    const int addon_files = metal ? 11 : 5;
+     const uint8_t *addon = NULL;
+     uint64_t bytes = 0;
+     unsigned stage = 1;
+     int error = EAUTH;
+     if (!smufs_aks_fresh_data_ready() || !scratch || scratch > UINT64_MAX - 4096 ||
+         proc_getpid(current_proc()) != 1 || !native_ram_block_gpu_addon(&addon, &bytes) ||
+-        (metal ? bytes <= wallpaper_bytes : bytes != wallpaper_bytes)) goto done;
+-    // R59 carries the original five compressed wallpaper records first, followed by the signed addon.
+-    static const uint8_t wallpaper_header[24] = {
+-        'N', 'G', 'P', 'U', 'A', 'D', 'D', '2', 5, 0, 0, 0, 0, 0, 0, 0,
+-        0x28, 0x4f, 0xa2, 0, 0, 0, 0, 0,
+-    };
++        bytes != addon_bytes) goto done;
++    static const uint8_t metal_addon_hash[32] = {0xff,0x65,0xd1,0x5f,0xe2,0xce,0x67,0x58,0xd5,0x5f,0x07,0x57,0xce,0xee,0x34,0xf5,0xa7,0x17,0x35,0x63,0x05,0xd0,0x9f,0x01,0xfb,0x1f,0x6f,0xaf,0xb1,0x99,0x5d,0x86};
+     uint8_t hash[32];
+     SHA256_CTX sha;
+     SHA256_Init(&sha);
+-    if (metal) {
+-        SHA256_Update(&sha, wallpaper_header, sizeof(wallpaper_header));
+-        SHA256_Update(&sha, addon + sizeof(wallpaper_header), wallpaper_bytes - sizeof(wallpaper_header));
+-    } else {
+-        SHA256_Update(&sha, addon, bytes);
+-    }
++    SHA256_Update(&sha, addon, bytes);
+     SHA256_Final(hash, &sha);
+-    if (memcmp(hash, addon_hash, sizeof(hash))) goto done;
++    if (memcmp(hash, metal ? metal_addon_hash : addon_hash, sizeof(hash))) goto done;
+ 
+     stage = 2;
+     vfs_context_t ctx = vfs_context_kernel();
+@@ -1765,7 +1757,7 @@
+     error = smufs_library_verify("/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/main.caml", root, 106340, original_hash);
+     if (error) goto done;
+     native_gpu_addon_install(current_proc(), scratch);
+-    if ((metal ? native_gpu_addon_files < 9 : native_gpu_addon_files != 5) || native_gpu_addon_failed ||
++    if (native_gpu_addon_files != addon_files || native_gpu_addon_failed ||
+         native_gpu_addon_written + native_gpu_addon_same != native_gpu_addon_files) {
+         error = native_gpu_addon_error ? native_gpu_addon_error : EIO;
+         goto done;
+@@ -1775,10 +1767,10 @@
+     error = kernel_mount("bindfs", NULLVP, NULLVP, target, (void *)source, sizeof(source), flags, 0, ctx);
+     if (error) goto done;
+     stage = 4;
+-    static const struct { const char *path; uint64_t bytes; bool upper; } files[] = {
++    const struct { const char *path; uint64_t bytes; bool upper; } files[] = {
+         { "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/main.caml", 105940, true },
+-        { "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/J120.png", 5442269, true },
+-        { "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/J120-Dark.png", 5215536, true },
++        { "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/J120.png", metal ? 3325209 : 5442269, true },
++        { "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/J120-Dark.png", metal ? 3183899 : 5215536, true },
+         { "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/assets/J120.HEIC", 2747367, false },
+     };
+     for (unsigned i = 0; !error && i < sizeof(files) / sizeof(files[0]); ++i) {

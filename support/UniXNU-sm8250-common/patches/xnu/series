@@ -1,0 +1,5 @@
+# SM8250 patch series, applied between the ARM64 and OS series.
+#
+# Empty: no SoC-specific XNU patch is needed for the first bring-up. Patches that
+# carry shared platform behaviour go here, one path per line, in application order.
+sheng-platform-power.patch

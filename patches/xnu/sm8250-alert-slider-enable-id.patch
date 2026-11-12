@@ -1,0 +1,55 @@
+--- a/bsd/dev/Sm8250AlertSlider.c
++++ b/bsd/dev/Sm8250AlertSlider.c
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: BSD-2-Clause-Patent */
+ /* IN2020 factory DTS i2c@984000; gcc-kona.c wrap0 S1; pinctrl-kona.c GPIO4/5.
+  * Discovery only: no sensor configuration writes. L10 is qualified and
+- * brought up at 3008 mV through the existing bounded RPMh sender.
++ * brought up with a 3008 mV vote followed by enable through the bounded RPMh sender.
+  * Called before the physical-key worker acquires the shared SPMI observer.
+  */
+ #include <kern/clock.h>
+@@ -143,17 +143,29 @@
+         (void *)(rsc + RscTcsBase + RscTcsStride)};
+     kebab_rpmh_tcs_init_global(&channel, io);
+     /* Do not change a rail another client has already enabled. */
+-    if (mv != 3008) {
++    if (!en || mv != 3008) {
+         if (en || !slider_send(&channel, false) ||
+             !slider_pmic(match.apid, 0x40, &lo) || !slider_pmic(match.apid, 0x41, &hi)) goto out;
+         mv = ((unsigned)hi << 8) | lo;
+-        if (mv != 3008) goto out;
++        /* Vendor qcom-rpmh-regulator.c set_enable_state(): acknowledged
++         * voltage request, then enable. A disabled PMIC VSET is observational;
++         * it is not an acknowledgement register for the RPMh request.
++         */
++        printf("SLIDER voltage-vote accepted target=3008 pmic-before-enable=%u en=%x\n", mv, en);
+     }
+     if (!en && !slider_send(&channel, true)) goto out;
+     delay(20000);
+-    ready = slider_pmic(match.apid, 0x46, &en) && en == 0x80 &&
+-        slider_pmic(match.apid, 0x40, &lo) && slider_pmic(match.apid, 0x41, &hi) &&
+-        (((unsigned)hi << 8) | lo) == 3008;
++    /* Accept identification only after a consistent enabled, target-voltage
++     * observation. Keep reads bounded, and retain every final value on failure.
++     */
++    for (unsigned tries = 0; tries < 21; ++tries) {
++        const bool observed = slider_pmic(match.apid, 0x46, &en) &&
++            slider_pmic(match.apid, 0x40, &lo) && slider_pmic(match.apid, 0x41, &hi);
++        mv = ((unsigned)hi << 8) | lo;
++        ready = observed && en == 0x80 && mv == 3008;
++        if (ready || !observed) break;
++        if (tries < 20) delay(1000);
++    }
+ out:
+     printf("SLIDER rail-after mv=%u en=%x ready=%u\n", mv, en, ready);
+     if (rsc) ml_io_unmap(rsc, Window);
+@@ -245,7 +257,7 @@
+ {
+     unsigned enabled = 0;
+     if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || enabled != 1) return;
+-    printf("SLIDER probe begin mode=poll-id\n");
++    printf("SLIDER probe begin mode=enable-id\n");
+     vm_offset_t branches = ml_io_map_unmappable(GccBranch, Window, VM_WIMG_IO);
+     vm_offset_t votes = ml_io_map_unmappable(GccVotes, Window, VM_WIMG_IO);
+     vm_offset_t pins = ml_io_map_unmappable(Pins4, Window, VM_WIMG_IO);

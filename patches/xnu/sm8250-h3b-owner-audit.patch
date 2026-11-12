@@ -1,0 +1,61 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -83,6 +83,7 @@
+ #include <sys/filedesc.h>
+ #include <sys/kernel.h>
+ #include <sys/mount_internal.h>
++#include <sys/smufs_owner_audit.h>
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/systm.h>
+@@ -608,6 +609,8 @@
+ 	struct vfsstatfs *stat = mounted ? vfs_statfs(mounted) : NULL;
+ 	const char *fsname = stat ? stat->f_fstypename : "none";
+ 	if (device_vnode) vnode_put(device_vnode);
++	struct SmUfsOwnerAudit smufs_owner;
++	smufs_owner_root_audit((uint32_t)rootdev, (uint32_t)mounted_dev, &smufs_owner);
+ 	int audit_enabled = 0, trust_enabled = 0, owner_decision = -1, owner_readonly = -1;
+ 	dev_t owner_mount = NODEV, owner_selected = NODEV;
+ #if defined(XNU_OWNER_ROOT_AUDIT) && XNU_OWNER_ROOT_AUDIT
+@@ -624,8 +627,10 @@
+ #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST
+ 	trust_enabled = 1;
+ #endif
+-	panic("SMUFS root-h3-auth autherr=%d owner_auth=%d require=%d\n"
++	panic("SMUFS root-h3b-audit autherr=%d owner_auth=%d require=%d\n"
+ 	      "root %s selected%x mounted%x mount-valid%d vnode%d ro%d flags%llx fs=%s\n"
++	      "smufs en%u policy%u sig%u imm%u bound%u uniq%u uuid%u typed%u chain%u ro%u\n"
++	      "units%llu checked%llu bad%llu media%llx trust0\n"
+ 	      "owner audit%d trust%d decision%d ro%d selected%x mounted%x\n"
+ 	      "trace en%u coherent%u partial%u lost%u writes%u\n"
+ 	      "mount%u/%u errno%d secure%u/%u\n"
+@@ -634,6 +639,10 @@
+ 	      autherr, owner_authorized, require_rootauth,
+ 	      rootdevice, (uint32_t)rootdev, (uint32_t)mounted_dev, mounted != NULL, rootvnode != NULLVP,
+ 	      (mount_flags & MNT_RDONLY) != 0, (unsigned long long)mount_flags, fsname,
++	      smufs_owner.enabled, smufs_owner.policy, smufs_owner.signature_status, smufs_owner.immutable,
++	      smufs_owner.bound, smufs_owner.unique, smufs_owner.uuid, smufs_owner.typed, smufs_owner.chain, smufs_owner.readonly,
++	      (unsigned long long)smufs_owner.units, (unsigned long long)smufs_owner.verified,
++	      (unsigned long long)smufs_owner.failures, (unsigned long long)smufs_owner.media_id,
+ 	      audit_enabled, trust_enabled, owner_decision, owner_readonly, (uint32_t)owner_selected, (uint32_t)owner_mount,
+ 	      snapshot.enabled, coherent, snapshot.partial, snapshot.lost, snapshot.writes,
+ 	      r[SMRT_MOUNT_ENTER].count, r[SMRT_MOUNT_RETURN].count, r[SMRT_MOUNT_RETURN].result,
+--- /dev/null
++++ b/bsd/sys/smufs_owner_audit.h
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++#ifndef SMUFS_OWNER_AUDIT_H
++#define SMUFS_OWNER_AUDIT_H
++#include <stdint.h>
++struct SmUfsOwnerAudit {
++ uint32_t enabled,policy,signature_status,immutable,bound,unique,uuid,typed,chain,readonly;
++ uint64_t units,verified,failures,media_id;
++};
++#ifdef __cplusplus
++extern "C" {
++#endif
++void smufs_owner_root_audit(uint32_t selected,uint32_t mounted,struct SmUfsOwnerAudit *out);
++#ifdef __cplusplus
++}
++#endif
++#endif

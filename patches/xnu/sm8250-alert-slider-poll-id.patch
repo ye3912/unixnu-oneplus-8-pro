@@ -1,0 +1,65 @@
+--- a/bsd/dev/Sm8250AlertSlider.c
++++ b/bsd/dev/Sm8250AlertSlider.c
+@@ -245,13 +245,15 @@
+ {
+     unsigned enabled = 0;
+     if (!PE_parse_boot_argn("sm8250-slider-probe", &enabled, sizeof(enabled)) || enabled != 1) return;
+-    printf("SLIDER probe begin mode=power-id\n");
++    printf("SLIDER probe begin mode=poll-id\n");
+     vm_offset_t branches = ml_io_map_unmappable(GccBranch, Window, VM_WIMG_IO);
+     vm_offset_t votes = ml_io_map_unmappable(GccVotes, Window, VM_WIMG_IO);
+     vm_offset_t pins = ml_io_map_unmappable(Pins4, Window, VM_WIMG_IO);
+     vm_offset_t engine = 0;
+     uint32_t added_votes = 0;
+     bool pins_changed = false, idle = true, configured = false;
++    bool route_masked = false;
++    uint32_t saved_route = 0;
+     static const uint32_t setup_regs[] = {0x28, 0x24, 0x20, 0x7c, GENI_CLK_CFG, GENI_SCL_COUNTERS};
+     uint32_t setup_saved[sizeof(setup_regs) / sizeof(setup_regs[0])];
+     if (!branches || !votes || !pins) {printf("SLIDER probe skipped=map\n"); goto done;}
+@@ -293,16 +295,30 @@
+     const uint32_t fw = slider_read(se, GENI_FW_REVISION), state = slider_read(se, Status);
+     const uint32_t irq = slider_read(se, GENI_M_IRQ_STATUS), route = slider_read(se, GENI_SE_IRQ_EN);
+     const uint32_t clock = slider_read(se, GENI_CLK_CFG), timing = slider_read(se, GENI_SCL_COUNTERS);
++    const uint32_t gsi = slider_read(se, GsiEnable), dma = slider_read(se, GENI_DMA_MODE);
++    const uint32_t disabled = slider_read(se, GENI_IF_DISABLE);
++    const uint32_t tx = slider_read(se, TxStatus), rx = slider_read(se, GENI_RX_FIFO_STATUS);
++    const uint32_t watermark = slider_read(se, GENI_TX_WATERMARK);
+     /* An engine already active at handoff is not ours to stop or clock off. */
+     idle = !(state & Active);
+     printf("SLIDER engine fw=%x state=%x irq=%x route=%x clock=%x timing=%x\n", fw, state, irq, route, clock, timing);
++    printf("SLIDER engine-state gsi=%x dma=%x disabled=%x tx=%x rx=%x watermark=%x\n", gsi, dma, disabled, tx, rx, watermark);
+     if (((fw >> 8) & 0xff) != GENI_PROTO_I2C || (state & Active) || irq ||
+-        (route & GENI_SE_M_IRQ_EN) || slider_read(se, GsiEnable) ||
+-        (slider_read(se, GENI_IF_DISABLE) & 1) || (slider_read(se, GENI_DMA_MODE) & 1) ||
+-        (slider_read(se, TxStatus) & 0xfffffff) || (slider_read(se, GENI_RX_FIFO_STATUS) & 0x1ffffff) ||
+-        slider_read(se, GENI_TX_WATERMARK)) {
++        (route != 0 && route != 0xf) || gsi || (disabled & 1) || (dma & 1) ||
++        (tx & 0xfffffff) || (rx & 0x1ffffff) || watermark) {
+         printf("SLIDER probe skipped=engine-state\n"); goto done;
+     }
++    /* GENI_SE_IRQ_EN is the engine's output gate, not proof of an active
++     * owner. For the observed idle FIFO handoff, poll with all four outputs
++     * masked; restore the firmware gate only after the engine is idle.
++     */
++    saved_route = route;
++    route_masked = true;
++    slider_write(se, GENI_SE_IRQ_EN, route & ~0xfu);
++    if (slider_read(se, GENI_SE_IRQ_EN) != (route & ~0xfu)) {
++        printf("SLIDER probe skipped=irq-mask-readback\n"); goto done;
++    }
++    printf("SLIDER polling route=%x->%x\n", route, slider_read(se, GENI_SE_IRQ_EN));
+     if (!slider_power_ready()) {printf("SLIDER probe skipped=rail\n"); goto done;}
+     slider_write((void *)pins, 0, 4);
+     pins_changed = true;
+@@ -333,6 +349,10 @@
+         slider_write((void *)pins, 0, p4);
+         slider_write((void *)pins, 0x1000, p5);
+     }
++    if (engine && route_masked && idle) {
++        slider_write((void *)engine, GENI_SE_IRQ_EN, saved_route);
++        printf("SLIDER irq-restore target=%x actual=%x\n", saved_route, slider_read((void *)engine, GENI_SE_IRQ_EN));
++    }
+     if (engine) ml_io_unmap(engine, Window);
+     if (added_votes && idle) slider_write((void *)votes, VoteReg, slider_read((void *)votes, VoteReg) & ~added_votes);
+     if (pins) ml_io_unmap(pins, Window);

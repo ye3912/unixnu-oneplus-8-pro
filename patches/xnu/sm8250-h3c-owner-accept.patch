@@ -1,0 +1,109 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -593,11 +593,10 @@
+     return smufs_rt_core_snapshot(&smufs_root_trace_state, out);
+ }
+ 
+-/* H3 diagnostic: entered only from the existing authentication refusal branch.
+- * Snapshot storage is static to avoid placing a 2 KiB record on the boot stack.
+- * No authentication operation is retried and no acceptance decision is changed. */
++/* H3C observer: refusal and the post-devfs boundary. Evidence stays in panic. */
++static int smufs_saved_autherr=-1, smufs_saved_owner=0, smufs_saved_require=0, smufs_saved_seen=0;
+ __attribute__((noinline, noreturn)) static void
+-native_smufs_auth_diag(int autherr, int owner_authorized, int require_rootauth)
++native_smufs_auth_diag(const char *boundary, int autherr, int owner_authorized, int require_rootauth, int devfs_error)
+ {
+ 	static SmUfsRootTraceSnapshot snapshot;
+ 	uint32_t coherent = native_smufs_root_trace_snapshot(&snapshot);
+@@ -627,22 +626,23 @@
+ #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST
+ 	trust_enabled = 1;
+ #endif
+-	panic("SMUFS root-h3b-audit autherr=%d owner_auth=%d require=%d\n"
++	panic("SMUFS root-h3c phase=%s autherr=%d owner_auth=%d require=%d seen%d devfs-errno%d\n"
+ 	      "root %s selected%x mounted%x mount-valid%d vnode%d ro%d flags%llx fs=%s\n"
+ 	      "smufs en%u policy%u sig%u imm%u bound%u uniq%u uuid%u typed%u chain%u ro%u\n"
+-	      "units%llu checked%llu bad%llu media%llx trust0\n"
++	      "units%llu checked%llu bad%llu media%llx self%u/15 trust%u\n"
+ 	      "owner audit%d trust%d decision%d ro%d selected%x mounted%x\n"
+ 	      "trace en%u coherent%u partial%u lost%u writes%u\n"
+ 	      "mount%u/%u errno%d secure%u/%u\n"
+ 	      "vfsroot%u/%u errno%d published%u valid%u dev%x\n"
+ 	      "auth%u/%u errno%d devfs%u/%u errno%d\n",
+-	      autherr, owner_authorized, require_rootauth,
++	      boundary, autherr, owner_authorized, require_rootauth, smufs_saved_seen, devfs_error,
+ 	      rootdevice, (uint32_t)rootdev, (uint32_t)mounted_dev, mounted != NULL, rootvnode != NULLVP,
+ 	      (mount_flags & MNT_RDONLY) != 0, (unsigned long long)mount_flags, fsname,
+ 	      smufs_owner.enabled, smufs_owner.policy, smufs_owner.signature_status, smufs_owner.immutable,
+ 	      smufs_owner.bound, smufs_owner.unique, smufs_owner.uuid, smufs_owner.typed, smufs_owner.chain, smufs_owner.readonly,
+ 	      (unsigned long long)smufs_owner.units, (unsigned long long)smufs_owner.verified,
+ 	      (unsigned long long)smufs_owner.failures, (unsigned long long)smufs_owner.media_id,
++	      smufs_owner.selftests, smufs_owner.trust_requested,
+ 	      audit_enabled, trust_enabled, owner_decision, owner_readonly, (uint32_t)owner_selected, (uint32_t)owner_mount,
+ 	      snapshot.enabled, coherent, snapshot.partial, snapshot.lost, snapshot.writes,
+ 	      r[SMRT_MOUNT_ENTER].count, r[SMRT_MOUNT_RETURN].count, r[SMRT_MOUNT_RETURN].result,
+@@ -1218,11 +1218,22 @@
+ 				native_owner_root_checkpoint(autherr, owner, device);
+ 			}
+ #endif
++			/* Independent owner policy; the Apple ioctl result is retained. */
++			{
++				mount_t smufs_mount = rootvnode ? vnode_mount(rootvnode) : NULL;
++				vnode_t smufs_device = smufs_mount ? vfs_devvp(smufs_mount) : NULLVP;
++				dev_t smufs_dev = smufs_device ? vnode_specrdev(smufs_device) : NODEV;
++				uint32_t smufs_ro = smufs_mount && ((vfs_flags(smufs_mount) & MNT_RDONLY) != 0);
++				owner_authorized = smufs_owner_root_accept((uint32_t)rootdev, (uint32_t)smufs_dev, smufs_ro, autherr);
++				if (smufs_device) vnode_put(smufs_device);
++			}
++			smufs_saved_autherr = autherr; smufs_saved_owner = owner_authorized;
++			smufs_saved_require = require_rootauth; smufs_saved_seen = 1;
+ 			if (autherr && !owner_authorized) {
+ 				uint32_t smufs_auth_diagnostics = 0;
+ 				if (PE_parse_boot_argn("native-ufs-auth-diag", &smufs_auth_diagnostics,
+ 				    sizeof(smufs_auth_diagnostics)) && smufs_auth_diagnostics) {
+-					native_smufs_auth_diag(autherr, owner_authorized, require_rootauth);
++					native_smufs_auth_diag("refused", autherr, owner_authorized, require_rootauth, 0);
+ 				}
+ 				panic("rootvp not authenticated after mounting");
+ 			}
+@@ -1288,6 +1299,10 @@
+ 		native_smufs_root_trace_emit(SMRT_DEVFS_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 		int smufs_devfs_error = devfs_kernel_mount(mounthere);
+ 		native_smufs_root_trace_emit(SMRT_DEVFS_RETURN, 0, SMRT_ERRNO, smufs_devfs_error, 0, 0);
++		uint32_t smufs_stop_after_devfs = 0;
++		if (PE_parse_boot_argn("native-ufs-owner-stop-after-devfs", &smufs_stop_after_devfs, sizeof(smufs_stop_after_devfs)) && smufs_stop_after_devfs == 1)
++			native_smufs_auth_diag("after-devfs", smufs_saved_autherr, smufs_saved_owner, smufs_saved_require, smufs_devfs_error);
++
+ 	}
+ #endif /* DEVFS */
+ 
+--- a/bsd/sys/smufs_owner_audit.h
++++ b/bsd/sys/smufs_owner_audit.h
+@@ -2,14 +2,27 @@
+ #ifndef SMUFS_OWNER_AUDIT_H
+ #define SMUFS_OWNER_AUDIT_H
+ #include <stdint.h>
++enum { SMUFS_OWNER_SELFTEST_REQUIRED=15u };
+ struct SmUfsOwnerAudit {
+  uint32_t enabled,policy,signature_status,immutable,bound,unique,uuid,typed,chain,readonly;
++ uint32_t selftests,trust_requested;
+  uint64_t units,verified,failures,media_id;
+ };
++/* Darwin EAUTH=80 remains the Apple result. This is a separate owner decision. */
++static inline uint32_t smufs_owner_accept_evidence(const struct SmUfsOwnerAudit *v,
++    uint32_t selected,uint32_t mounted,uint32_t mount_readonly,int32_t apple_error)
++{
++ return v && apple_error==80 && mount_readonly==1 && selected==mounted && mounted!=0xffffffffU &&
++     v->trust_requested==1 && v->enabled==1 && v->policy==1 && v->signature_status==0 &&
++     v->immutable==1 && v->bound==1 && v->unique==1 && v->uuid==1 && v->typed==1 &&
++     v->chain==1 && v->readonly==1 && v->selftests==SMUFS_OWNER_SELFTEST_REQUIRED &&
++     v->verified>0 && v->failures==0;
++}
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ void smufs_owner_root_audit(uint32_t selected,uint32_t mounted,struct SmUfsOwnerAudit *out);
++uint32_t smufs_owner_root_accept(uint32_t selected,uint32_t mounted,uint32_t mount_readonly,int32_t apple_error);
+ #ifdef __cplusplus
+ }
+ #endif

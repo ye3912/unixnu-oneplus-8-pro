@@ -1,0 +1,8 @@
+{
+  "artifact_id": 13684985374,
+  "artifact_sha256": "1316af90ccd17434d6d5c099b58782ea116500338bb40275a89dc8d62b957971",
+  "addon_sha256": "2fd4c1dd89b6c16d2aeada2f83435da486336c27d0f9eda43ec474ff1fef946f",
+  "trust_sha256": "8bdcffe7c85568c11380d97a50d125b6ea75d1e98555eeba72cc0bf132eb9ce0",
+  "plugin_cdhash": "df32fd869db2bb5c52f5e80e7dfdf5400f52ad13",
+  "turnip_cdhash": "3297afeb00c265ebbf9d08cbaa889eef76b2b391"
+}

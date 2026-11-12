@@ -1,0 +1,59 @@
+--- a/bsd/dev/Sm8250Keys.c
++++ b/bsd/dev/Sm8250Keys.c
+@@ -30,6 +30,43 @@
+     return kebab_spmi_obs_read_ex(apid, 0, reg, 1, false, true, value) == 0;
+ }
+ 
++/*
++ * IN2020 factory key_vol_down_default selects the normal active-low
++ * PM8150 GPIO7 input, VIN 1, and bias-pull-up. Some boots leave it
++ * pulled down. Restore only DIG_PULL_CTL and only on the owned APID.
++ */
++static bool
++gpio7_restore_pull(uint32_t apid, uint32_t base, uint8_t *pull)
++{
++    uint8_t vin = 0;
++    struct kebab_spmi_match match;
++    if (base != 0xc600 || (*pull & 7u) != 4u ||
++        !key_read(apid, base + 0x41, &vin) || (vin & 7u) != 1u ||
++        kebab_spmi_scan(base >> 8, &match, 1) != 1 ||
++        match.apid != apid || match.write_ee != KEBAB_SPMI_EE || spmi.chnl_mapped) {
++        printf("KEY46 gpio7 pull unchanged: configuration or write owner mismatch vin=%x\n", vin);
++        return false;
++    }
++
++    const vm_offset_t channel = ml_io_map_unmappable(
++        KEBAB_SPMI_CHNLS_PA + 0x10000u * apid, KEBAB_SPMI_CHNL_SLICE, VM_WIMG_IO);
++    if (!channel) return false;
++    spmi.chnl = channel;
++    spmi.chnl_apid = apid;
++    spmi.chnl_mapped = true;
++    /* PMIC_GPIO_PULL_UP_30 is the vendor driver's bias-pull-up encoding. */
++    const uint8_t wanted = *pull & ~7u;
++    const bool written = kebab_spmi_rw_write(apid, 0, base + 0x42, wanted) == 0;
++    spmi.chnl_mapped = false;
++    spmi.chnl = 0;
++    spmi.chnl_apid = 0;
++    ml_io_unmap(channel, KEBAB_SPMI_CHNL_SLICE);
++
++    const bool confirmed = key_read(apid, base + 0x42, pull) && *pull == wanted;
++    printf("KEY46 gpio7 pull target=%x readback=%x status=%u\n", wanted, *pull, written && confirmed);
++    return written && confirmed;
++}
++
+ static bool
+ gpio_ready(uint32_t apid, uint32_t base)
+ {
+@@ -37,8 +74,10 @@
+     const bool readable = key_read(apid, base + 4, &type) &&
+         key_read(apid, base + 0x40, &mode) && key_read(apid, base + 0x42, &pull) &&
+         key_read(apid, base + 0x46, &enable);
+-    const bool ok = readable && type == KEBAB_KEYS_GPIO_TYPE &&
+-        !(mode & 3) && (pull & 7) < 4 && (enable & 0x80);
++    const bool input = readable && type == KEBAB_KEYS_GPIO_TYPE &&
++        !(mode & 3) && (enable & 0x80);
++    const bool ok = input && ((pull & 7) < 4 ||
++        (base == 0xc600 && mode == 0 && gpio7_restore_pull(apid, base, &pull)));
+     printf("KEY46 pin base=%x apid=%x type=%x mode=%x pull=%x enable=%x valid=%u\n",
+         base, apid, type, mode, pull, enable, ok);
+     return ok;

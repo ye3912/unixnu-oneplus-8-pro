@@ -1,0 +1,160 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -82,6 +82,8 @@
+ #include <sys/param.h>
+ #include <libkern/crypto/sha2.h>
+ #include <sys/filedesc.h>
++#include <sys/dirent.h>
++#include <sys/uio.h>
+ #include <sys/kernel.h>
+ #include <sys/mount_internal.h>
+ #include <sys/smufs_owner_audit.h>
+@@ -1784,6 +1786,140 @@
+     printf("GPU59 mode12 result status=%x stage=%u\n", error, stage);
+ }
+ 
++
++/* Export a bounded prefix of the latest Settings crash report on verified Data. */
++static void
++sm8250_preferences_report(void)
++{
++    enum { directory_bytes = 4096, report_limit = 768 * 1024 };
++    static const char *const dirs[] = {
++        "/private/var/mobile/Library/Logs/CrashReporter",
++        "/private/var/mobile/Library/Logs/CrashReporter/Retired",
++        "/private/var/root/Library/Logs/CrashReporter",
++    };
++    unsigned enabled = 0;
++    if (!PE_parse_boot_argn("sm8250-pref-report", &enabled, sizeof(enabled)) || enabled != 1 ||
++        proc_getpid(current_proc()) != 1 || native_data_persist_state != 2) {
++        return;
++    }
++    vfs_context_t ctx = vfs_context_kernel();
++    vnode_t data = NULLVP;
++    int error = vnode_lookup("/private/var", VNODE_LOOKUP_NOFOLLOW, &data, ctx);
++    if (error) {
++        printf("PREFIPS data-lookup error=%d\n", error);
++        return;
++    }
++    mount_t data_mount = vnode_mount(data);
++    char *buffer = kalloc_data(directory_bytes, Z_WAITOK);
++    if (!buffer) {
++        vnode_put(data);
++        printf("PREFIPS buffer error=%d\n", ENOMEM);
++        return;
++    }
++    struct timespec latest_time = {0};
++    vnode_t latest = NULLVP;
++    uint64_t file_size = 0;
++    for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); ++i) {
++        vnode_t dir = NULLVP;
++        error = vnode_open(dirs[i], FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &dir, ctx);
++        if (error) {
++            printf("PREFIPS directory=%u error=%d\n", i, error);
++            continue;
++        }
++        if (!vnode_isdir(dir) || vnode_mount(dir) != data_mount) {
++            vnode_close(dir, FREAD, ctx);
++            continue;
++        }
++        uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++        if (!uio) {
++            vnode_close(dir, FREAD, ctx);
++            continue;
++        }
++        int eof = 0;
++        for (unsigned page = 0; !eof && page < 16; ++page) {
++            int entries = 0;
++            uio_reset(uio, uio_offset(uio), UIO_SYSSPACE, UIO_READ);
++            error = uio_addiov(uio, CAST_USER_ADDR_T(buffer), directory_bytes);
++            if (!error) error = VNOP_READDIR(dir, uio, 0, &eof, &entries, ctx);
++            if (error || uio_resid(uio) > directory_bytes) break;
++            size_t used = directory_bytes - (size_t)uio_resid(uio);
++            if (!used) break;
++            const size_t name_offset = offsetof(struct dirent, d_name);
++            for (size_t at = 0; used - at >= name_offset; ) {
++                const struct dirent *entry = (const struct dirent *)(buffer + at);
++                const size_t record = entry->d_reclen;
++                const size_t length = entry->d_namlen;
++                if (record < name_offset + 1 || record > used - at || (record & 3)) break;
++                at += record;
++                const char *name = entry->d_name;
++                if (length < 16 || length > 120 || length >= record - name_offset ||
++                    name[length] || strnlen(name, length) != length || strchr(name, '/') ||
++                    memcmp(name, "Preferences-", 12) || memcmp(name + length - 4, ".ips", 4)) {
++                    continue;
++                }
++                char path[256];
++                snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
++                vnode_t file = NULLVP;
++                if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &file, ctx)) continue;
++                struct vnode_attr attr;
++                VATTR_INIT(&attr);
++                VATTR_WANTED(&attr, va_modify_time);
++                VATTR_WANTED(&attr, va_data_size);
++                if (vnode_mount(file) == data_mount && vnode_isreg(file) &&
++                    !vnode_getattr(file, &attr, ctx) && VATTR_IS_SUPPORTED(&attr, va_modify_time) &&
++                    VATTR_IS_SUPPORTED(&attr, va_data_size) && attr.va_data_size &&
++                    (!latest || attr.va_modify_time.tv_sec > latest_time.tv_sec ||
++                    (attr.va_modify_time.tv_sec == latest_time.tv_sec &&
++                    attr.va_modify_time.tv_nsec > latest_time.tv_nsec))) {
++                    if (latest) vnode_put(latest);
++                    latest = file;
++                    latest_time = attr.va_modify_time;
++                    file_size = attr.va_data_size;
++                } else {
++                    vnode_put(file);
++                }
++            }
++        }
++        uio_free(uio);
++        vnode_close(dir, FREAD, ctx);
++        printf("PREFIPS directory=%u scan-error=%d eof=%d\n", i, error, eof);
++    }
++    if (latest) {
++        const unsigned bytes = (unsigned)MIN(file_size, report_limit);
++        static const char hex[] = "0123456789abcdef";
++        unsigned done = 0;
++        printf("PREFIPS begin bytes=%u total=%llu\n", bytes, (unsigned long long)file_size);
++        while (done < bytes) {
++            const unsigned chunk = MIN((unsigned)directory_bytes, bytes - done);
++            int residual = 0;
++            error = vn_rdwr(UIO_READ, latest, buffer, (int)chunk, done, UIO_SYSSPACE,
++                0, vfs_context_ucred(ctx), &residual, vfs_context_proc(ctx));
++            if (error || residual) {
++                printf("PREFIPS read off=%u error=%d residual=%d\n", done, error, residual);
++                break;
++            }
++            for (unsigned offset = 0; offset < chunk; offset += 128) {
++                char line[257];
++                unsigned length = MIN(128U, chunk - offset);
++                for (unsigned j = 0; j < length; ++j) {
++                    unsigned byte = (unsigned char)buffer[offset + j];
++                    line[j * 2] = hex[byte >> 4];
++                    line[j * 2 + 1] = hex[byte & 15];
++                }
++                line[length * 2] = 0;
++                printf("PREFIPS data off=%u %s\n", done + offset, line);
++            }
++            done += chunk;
++        }
++        printf("PREFIPS end bytes=%u\n", done);
++        vnode_put(latest);
++    } else {
++        printf("PREFIPS no-report\n");
++    }
++    kfree_data(buffer, directory_bytes);
++    vnode_put(data);
++}
++
+ /* The verified factory RAM Data volume supplies a read-only union upper. */
+ static void
+ sm8250_wallpaper_prepare(uint64_t scratch)
+@@ -2067,6 +2203,7 @@
+   if(v->error)panic("PKFRAME33 original framework namespace refused errno%d",v->error);
+   v->error=smufs_data_prepare(scratch,v);
+   if(v->error)panic("SMUFS data-h3t prepare refused %s",smufs_data_note());
++  sm8250_preferences_report();
+   sm8250_wallpaper_prepare(scratch);
+   v->error=native_smufs_boot_status_prepare();
+   if(v->error)panic("SMUFS boot-status-h3x prepare refused errno%d %s",v->error,native_smufs_boot_status_note());

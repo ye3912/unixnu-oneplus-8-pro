@@ -1,0 +1,31 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -126,6 +126,8 @@
+ extern void proc_getexecutableuuid(struct proc *, unsigned char *, unsigned long);
+ extern int native_sm_gui_cache_identity(task_t, unsigned char *, uint32_t *);
+ extern int native_sm_gui_fault_state(uint64_t *, unsigned);
++extern void native_sm8250_lsd_wait_begin(unsigned, int, const unsigned char *);
++extern void native_sm8250_lsd_wait_end(unsigned);
+ 
+ enum { PK30_MAX = 16, PK30_SLOTS_PER_KIND = 4, PK30_FRAMES = 24 };
+ enum pk31_kind { PK31_NONE, PK31_PLUGIN, PK31_ACTIVITY, PK31_SCREEN, PK31_CORE_SERVICES };
+@@ -424,6 +426,19 @@
+ 	if (event.kind == PK31_SCREEN || event.kind == PK31_CORE_SERVICES) {
+ 		char name[20] = {};
+ 		proc_selfname(name, sizeof(name));
++		if (event.kind == PK31_CORE_SERVICES) {
++			if (received && event.phase == PK30_REQUEST && status == MACH_MSG_SUCCESS &&
++			    !strcmp(name, "lsd")) {
++				struct proc *proc = get_bsdtask_info(current_task());
++				unsigned char uuid[16] = {};
++				if (proc) {
++					proc_getexecutableuuid(proc, uuid, sizeof(uuid));
++					native_sm8250_lsd_wait_begin(event.slot, task_pid(current_task()), uuid);
++				}
++			} else if (!received && event.phase == PK30_REPLY) {
++				native_sm8250_lsd_wait_end(event.slot);
++			}
++		}
+ 		printf("%s %s slot%u phase%u pid%d comm%s tid%llu status%x contention%u saturated%u\n",
+ 		    event.kind == PK31_CORE_SERVICES ? "COREXPC" : "SCREENIPC", received ? "receive" : "result", event.slot, event.phase,
+ 		    task_pid(current_task()), name, current_thread()->thread_id, (unsigned)status,

@@ -1,0 +1,107 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1817,6 +1817,74 @@
+ #endif /* (DEVELOPMENT || DEBUG) && CONFIG_COREDUMP */
+ }
+ 
++
++/* R22: limited owning-process diagnostics following GF0413; this cache's
++ * UUIDs and addresses were derived from original21H461 bytes, not20H392.
++ * Never changes signal/exit policy or invokes user code. */
++#if DEVELOPMENT || DEBUG
++extern int native_sm_gui_cache_identity(task_t, unsigned char *, uint32_t *);
++static void
++sm_gui_exit_evidence(proc_t p, int rv)
++{
++ static const unsigned char expected_cache[16]={0x59,0x0d,0x83,0x9a,0x82,0xd2,0x30,0xf1,0xa1,0x7d,0x0c,0xc0,0x53,0x42,0x0f,0x73};
++ static const struct {const char *name; uint64_t uuid_va, annotation_va; unsigned char uuid[16];} images[]={{"Foundation",0x186e21570ULL,0x1ed70b440ULL,{0x96,0x73,0x3d,0x34,0x0a,0x37,0x3c,0x34,0x81,0x0a,0x73,0x5d,0x17,0x20,0xae,0x42}},
++{"CoreFoundation",0x187e72208ULL,0x1ed77b650ULL,{0xa4,0x22,0xc5,0x78,0x54,0xc4,0x30,0xc6,0x86,0xd8,0x5e,0xa8,0x1d,0x96,0x94,0xbe}},
++{"libc++abi.dylib",0x1dd5307e0ULL,0x1efb39768ULL,{0xf1,0xb0,0xb7,0x0e,0xf8,0xd3,0x39,0xd9,0xa4,0xd6,0x03,0x68,0x5a,0xfe,0xe1,0xb6}}};
++ static unsigned counts[3];
++ const char *targets[]={"SpringBoard","backboardd","powerd"};
++ unsigned enabled=0,index;
++ if(p!=current_proc())return;
++ for(index=0;index<3;++index)if(!strcmp(p->p_comm,targets[index]))break;
++ if(index==3)return;
++ PE_parse_boot_argn("gui-exit-diag",&enabled,sizeof(enabled));
++ if(enabled!=1)return;
++ unsigned count=__atomic_load_n(&counts[index],__ATOMIC_RELAXED);
++ do {if(count>=3)return;} while(!__atomic_compare_exchange_n(&counts[index],&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
++ os_reason_t reason=p->p_exit_reason;
++ const char *description=exit_reason_get_string_desc(reason);
++ printf("GUIEXIT22 name=%s pid%d event%u sig%d exit%d ns%u code%llx desc=%.512s\n",
++  targets[index],proc_getpid(p),count+1,WTERMSIG(rv),WEXITSTATUS(rv),reason?reason->osr_namespace:0,
++  (unsigned long long)(reason?reason->osr_code:0),description?description:"none");
++ task_t task=proc_task(p);
++ unsigned char cache_uuid[16];uint32_t slide=0;
++ if(WTERMSIG(rv)!=SIGABRT || !task || !native_sm_gui_cache_identity(task,cache_uuid,&slide) || memcmp(cache_uuid,expected_cache,16))return;
++ printf("GUIEXIT22 cache-match1 slide%x\n",slide);
++ for(unsigned i=0;i<sizeof(images)/sizeof(images[0]);++i) {
++  unsigned char uuid[16];uint64_t first[8]={0},after[8]={0};
++  int error=copyin(images[i].uuid_va+slide,uuid,sizeof(uuid));
++  if(error || memcmp(uuid,images[i].uuid,16)) {
++   printf("GUIEXIT22 image=%s uuid-read%d match0\n",images[i].name,error);continue;
++  }
++  uint64_t annotation=images[i].annotation_va+slide;
++  error=copyin(annotation,first,sizeof(first));
++  if(error || first[0]!=5) {printf("GUIEXIT22 image=%s annotation-read%d unsupported\n",images[i].name,error);continue;}
++  for(unsigned field=0;field<2;++field) {
++   uint64_t address=first[field?4:1];char message[768]={0},check[768]={0};size_t length=0,check_length=0;
++   if(!address)continue;
++   if(address<0x10000ULL || address>0x7fffffffffULL-sizeof(message))continue;
++   error=copyinstr(address,message,sizeof(message),&length);
++   int check_error=copyinstr(address,check,sizeof(check),&check_length);
++   int annotation_error=copyin(annotation,after,sizeof(after));
++   bool truncated=(error==ENAMETOOLONG && check_error==ENAMETOOLONG);
++   if((error && !truncated) || (check_error && !truncated) || annotation_error ||
++     (!truncated && (!length || length!=check_length || length>sizeof(message))) ||
++     memcmp(message,check,sizeof(message)) || memcmp(first,after,sizeof(first))) {
++    printf("GUIEXIT22 image=%s field%u read%d/%d annotation%d stable0\n",images[i].name,field,error,check_error,annotation_error);continue;
++   }
++   unsigned char after_uuid[16];uint32_t after_slide=0;
++   if(!native_sm_gui_cache_identity(task,after_uuid,&after_slide) || memcmp(after_uuid,expected_cache,16) || after_slide!=slide)continue;
++   message[sizeof(message)-1]=0;
++   for(unsigned j=0;j<sizeof(message)-1 && message[j];++j)if((unsigned char)message[j]<32 || (unsigned char)message[j]>126)message[j]='?';
++   for(unsigned at=0;at<sizeof(message)-1 && message[at];at+=120) {
++    printf("GUIEXIT22 MESSAGE name=%s pid%d image=%s field%u off%u truncated%u text=%.120s\n",
++     targets[index],proc_getpid(p),images[i].name,field,at,truncated?1U:0U,message+at);
++    if(strlen(message+at)<=120)break;
++   }
++  }
++ }
++}
++#endif
++
+ static void
+ proc_handle_critical_exit(proc_t p, int rv)
+ {
+@@ -1892,6 +1960,9 @@
+ 	bool corpse_source = false;
+ 	task_t task = proc_task(p);
+ 
++#if DEVELOPMENT || DEBUG
++	sm_gui_exit_evidence(p, rv);
++#endif
+ 
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10285,3 +10285,17 @@
+ 	char *name = proc_best_name(task_get_proc_raw(task));
+ 	strlcpy(buf, name, size);
+ }
++
++/* R22: snapshot the owning task's cached dyld identity without user access. */
++#if DEVELOPMENT || DEBUG
++int native_sm_gui_cache_identity(task_t, unsigned char *, uint32_t *);
++int native_sm_gui_cache_identity(task_t task, unsigned char *uuid, uint32_t *slide)
++{
++ if(task!=current_task() || !uuid || !slide)return 0;
++ task_lock(task);
++ memcpy(uuid,task->task_shared_region_uuid,16);
++ *slide=task->task_shared_region_slide;
++ task_unlock(task);
++ return 1;
++}
++#endif

@@ -1,0 +1,22 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1247,6 +1247,8 @@
+ extern int native_sm8250_thermal_live_prepare(void);
+ extern const char *native_sm8250_thermal_live_note(void);
+ extern int native_sm8250_thermal_hid_prepare(void);
++extern int native_sm8250_thermal_wait_prepare(void);
++extern int native_sm8250_thermal_job_disable(uint64_t);
+ extern const char *native_sm8250_thermal_hid_note(void);
+ extern const char *native_smufs_cpu_policy_note(void);
+ extern int native_smufs_boot_status_prepare(void);
+@@ -1482,6 +1484,10 @@
+   if(v->error)panic("SMUFS thermal-h4c live prepare refused errno%d %s",v->error,native_sm8250_thermal_live_note());
+   v->error=native_sm8250_thermal_hid_prepare();
+   if(v->error)printf("SMUFS thermal-h4c hid unavailable errno%d %s\n",v->error,native_sm8250_thermal_hid_note());
++  v->error=native_sm8250_thermal_job_disable(scratch);
++  if(v->error)panic("SMUFS thermal-off18 policy refused errno%d",v->error);
++  v->error=native_sm8250_thermal_wait_prepare();
++  if(v->error)printf("SMUFS thermal-wait1 unavailable kr%d\n",v->error);
+   v->error=native_smufs_watchdog_prepare();
+   if(v->error)panic("SMUFS watchdog-h3v prepare refused errno%d %s",v->error,native_smufs_watchdog_note());
+   if(!smufs_cache_carrier_publish(v)){v->error=EAUTH;smufs_cache_probe_report("carrier-publication",v);}

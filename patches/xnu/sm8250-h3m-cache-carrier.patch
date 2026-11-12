@@ -1,0 +1,175 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -860,6 +860,89 @@
+  return (v->mode!=2 && v->mode!=3) || (v->system_flags==15 && !v->system_bad &&
+      (require_reads?(v->system_checked>0 && v->system_selftests==15):((v->system_selftests&7)==7)));
+ }
++/* H3M: publication follows all H3K/L gates; identity values are never dereferenced. */
++static struct {
++ vnode_t root; mount_t system_mount; uint32_t selected,ready;
++ uint64_t media;
++ uint32_t accepts,rejects,first_stage,map_enter,map_return;
++ int map_error,first_map_error;
++} smufs_cache_carrier;
++__attribute__((noinline)) static uint32_t
++smufs_cache_carrier_publish(const struct SmUfsCacheProbe *v)
++{
++ if(v->mode!=3||v->files!=53||!v->main_ok||!v->lib_ok||v->images!=3354||v->subs!=52||
++    !v->root_same||v->original_root!=rootvnode||!v->root_after||!smufs_cache_root_valid()||
++    !v->readonly||!v->fs_apfs||v->selected!=v->mounted||v->media!=v->postmedia||!v->media||
++    v->system_flags!=15||v->system_selftests!=15||!v->system_checked||v->system_bad||
++    __atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return 0;
++ smufs_cache_carrier.root=v->original_root;smufs_cache_carrier.system_mount=v->system_mount;
++ smufs_cache_carrier.selected=v->selected;smufs_cache_carrier.media=v->media;
++ __atomic_store_n(&smufs_cache_carrier.ready,1U,__ATOMIC_RELEASE);return 1;
++}
++__attribute__((noinline)) int
++native_smufs_cache_carrier(vnode_t process_root,vnode_t file)
++{
++ if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return 0;
++ uint32_t stage=1,allowed=0,selected=0xffffffffU,matches=0,tests=0;
++ uint64_t media=0,checked=0,bad=0;char device_path[64];
++ vnode_t directory=NULLVP,parent=NULLVP,device=NULLVP;const char *name=NULL;
++ mount_t root_mount=NULL,cache_mount=NULL;dev_t actual=NODEV;
++ if(!process_root||process_root!=rootvnode||process_root!=smufs_cache_carrier.root||
++    !file||vnode_vtype(file)!=VREG||!smufs_cache_root_valid())goto out;
++ stage=2;root_mount=vnode_mount(process_root);cache_mount=vnode_mount(file);
++ if(!root_mount||!cache_mount||root_mount==cache_mount||cache_mount!=smufs_cache_carrier.system_mount||
++    !(vfs_flags(root_mount)&MNT_RDONLY)||!(vfs_flags(cache_mount)&MNT_RDONLY)||
++    strcmp(vfs_statfs(root_mount)->f_fstypename,"apfs")||strcmp(vfs_statfs(cache_mount)->f_fstypename,"apfs"))goto out;
++ stage=3;device=vfs_devvp(cache_mount);actual=device?vnode_specrdev(device):NODEV;
++ if(device){vnode_put(device);device=NULLVP;}
++ if(actual==NODEV||(uint32_t)actual!=smufs_cache_carrier.selected)goto out;
++ stage=4;
++ if(!smufs_cache_probe_device((uint32_t)actual,&selected,device_path,&media,&matches)||
++    selected!=(uint32_t)actual||matches!=1||media!=smufs_cache_carrier.media)goto out;
++ stage=5;
++ if(vnode_lookup("/private/preboot/System/Library/Caches/com.apple.dyld",0,&directory,vfs_context_current())||
++    vnode_vtype(directory)!=VDIR||vnode_mount(directory)!=cache_mount)goto out;
++ stage=6;vnode_getparent_and_name(file,&parent,&name);
++ if(parent!=directory||!name)goto out;
++ stage=7;
++ for(uint32_t i=0;i<53;++i){if(!strcmp(name,smufs_cache_expected[i].name)){allowed=1;break;}}
++ if(!allowed)goto out;
++ allowed=0;stage=8;
++ if(smufs_systemos_snapshot(&checked,&bad,&tests)!=15||!checked||bad||tests!=15)goto out;
++ stage=9;
++ if(rootvnode!=process_root||!smufs_cache_root_valid()||!(vfs_flags(cache_mount)&MNT_RDONLY))goto out;
++ allowed=1;
++out:
++ if(name)vnode_putname(name);
++ if(parent)vnode_put(parent);
++ if(directory)vnode_put(directory);
++ if(allowed)__atomic_add_fetch(&smufs_cache_carrier.accepts,1U,__ATOMIC_RELAXED);
++ else{__atomic_add_fetch(&smufs_cache_carrier.rejects,1U,__ATOMIC_RELAXED);uint32_t zero=0;
++  (void)__atomic_compare_exchange_n(&smufs_cache_carrier.first_stage,&zero,stage,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED);}
++ return (int)allowed;
++}
++__attribute__((noinline)) void
++native_smufs_cache_map_event(uint32_t returning,int error)
++{
++ if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return;
++ if(!returning){__atomic_add_fetch(&smufs_cache_carrier.map_enter,1U,__ATOMIC_RELAXED);return;}
++ __atomic_store_n(&smufs_cache_carrier.map_error,error,__ATOMIC_RELAXED);
++ if(error){int zero=0;(void)__atomic_compare_exchange_n(&smufs_cache_carrier.first_map_error,&zero,error,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED);}
++ __atomic_add_fetch(&smufs_cache_carrier.map_return,1U,__ATOMIC_RELEASE);
++}
++__attribute__((noinline)) const char *
++native_smufs_cache_panic_note(void)
++{
++ static char note[224];
++ if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
++ snprintf(note,sizeof(note),"SMUFS cache-h3m prep1 carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n",
++     __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
++     __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
++     __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED));
++ return note;
++}
++
+ __attribute__((noinline,noreturn)) static void
+ smufs_cache_probe_report(const char *phase,struct SmUfsCacheProbe *v)
+ {
+@@ -949,7 +1032,8 @@
+      (v->error=copyout(vector,scratch+0x500,sizeof(vector))))smufs_cache_probe_report("cache-environment",v);
+   v->root_same=rootvnode==v->original_root;v->root_after=smufs_cache_root_valid();
+   if(!v->root_same||!v->root_after||!smufs_cache_integrity_valid(v,1)){v->error=EAUTH;smufs_cache_probe_report("continue-policy",v);}
+-  printf("SMUFS cache-h3l prepared flags%u self%u checked%llu bad%llu files%u env1 root%u; continuing original init\n",
++  if(!smufs_cache_carrier_publish(v)){v->error=EAUTH;smufs_cache_probe_report("carrier-publication",v);}
++  printf("SMUFS cache-h3m prepared flags%u self%u checked%llu bad%llu files%u env1 root%u; continuing original init\n",
+       v->system_flags,v->system_selftests,(unsigned long long)v->system_checked,(unsigned long long)v->system_bad,v->files,v->root_after);
+   uint64_t envp=scratch+0x500;kfree_data(v,sizeof(*v));return envp;
+  }
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -28,6 +28,10 @@
+ uint32_t native_smufs_init_mprotect_enter(uint64_t addr,uint64_t len,int32_t prot);
+ void native_smufs_init_mprotect_return(int32_t error);
+ void native_smufs_init_user_svc(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr);
++struct vnode;
++int native_smufs_cache_carrier(struct vnode *process_root,struct vnode *file);
++void native_smufs_cache_map_event(uint32_t returning,int error);
++const char *native_smufs_cache_panic_note(void);
+ uint64_t native_smufs_cache_prepare(uint64_t scratch);
+ __attribute__((noreturn)) void native_smufs_cache_probe(uint64_t scratch);
+ __attribute__((noreturn)) void native_smufs_init_diag(const char *phase,int error);
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -71,6 +71,7 @@
+ #include <sys/trace.h>
+ #include <sys/kernel.h>
+ #include <sys/ubc_internal.h>
++#include <sys/smufs_init_trace.h>
+ #include <sys/user.h>
+ #include <sys/syslog.h>
+ #include <sys/stat.h>
+@@ -2631,6 +2632,7 @@
+ #endif
+ 			error = vnode_lookup(PREBOOT_CRYPTEX_PATH, 0, &preboot_vp, vfs_context_current());
+ 			if ((error || srfmp->vp->v_mount != preboot_vp->v_mount)
++			    && !native_smufs_cache_carrier(rdir_vp, srfmp->vp)
+ #if defined(XNU_OWNER_CACHE_CARRIER) && XNU_OWNER_CACHE_CARRIER
+ 			    && !owner_carrier
+ #endif
+@@ -2970,6 +2972,7 @@
+ 	struct shared_file_mapping_slide_np *mappings = NULL;
+ 	kern_return_t                 kr = KERN_SUCCESS;
+ 
++	if (proc_getpid(p) == 1) native_smufs_cache_map_event(0, 0);
+ 	files_count = uap->files_count;
+ 	mappings_count = uap->mappings_count;
+ 
+@@ -3079,6 +3082,7 @@
+ done:
+ 	kfree_data(shared_files, files_count * sizeof(shared_files[0]));
+ 	kfree_data(mappings, mappings_count * sizeof(mappings[0]));
++	if (proc_getpid(p) == 1) native_smufs_cache_map_event(1, kr);
+ 	return kr;
+ }
+ 
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -95,6 +95,7 @@
+ #include <sys/ptrace.h>
+ #include <sys/proc_info.h>
+ #include <sys/reason.h>
++#include <sys/smufs_init_trace.h>
+ #include <sys/_types/_timeval64.h>
+ #include <sys/user.h>
+ #include <sys/aio_kern.h>
+@@ -1866,11 +1867,11 @@
+ 	sync(p, (void *)NULL, (int *)NULL);
+ 
+ 	if (p->p_exit_reason == OS_REASON_NULL) {
+-		panic_with_options(0, NULL, DEBUGGER_OPTION_INITPROC_PANIC, "%s -- no exit reason available -- (signal %d, exit status %d %s)",
+-		    prefix_str, WTERMSIG(rv), WEXITSTATUS(rv), ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""));
++		panic_with_options(0, NULL, DEBUGGER_OPTION_INITPROC_PANIC, "%s%s -- no exit reason available -- (signal %d, exit status %d %s)",
++		    native_smufs_cache_panic_note(), prefix_str, WTERMSIG(rv), WEXITSTATUS(rv), ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""));
+ 	} else {
+-		panic_with_options(0, NULL, DEBUGGER_OPTION_INITPROC_PANIC, "%s %s -- exit reason namespace %d subcode 0x%llx description: %." LAUNCHD_PANIC_REASON_STRING_MAXLEN "s",
+-		    ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""),
++		panic_with_options(0, NULL, DEBUGGER_OPTION_INITPROC_PANIC, "%s%s %s -- exit reason namespace %d subcode 0x%llx description: %." LAUNCHD_PANIC_REASON_STRING_MAXLEN "s",
++		    native_smufs_cache_panic_note(), ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""),
+ 		    prefix_str, p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
+ 		    exit_reason_desc ? exit_reason_desc : "none");
+ 	}

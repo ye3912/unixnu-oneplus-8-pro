@@ -1,0 +1,41 @@
+/dts-v1/;
+/include/ "sm8250.dtsi"
+
+/ {
+    model = "OnePlus 8 Pro";
+    compatible = "oneplus,instantnoodlep", "qcom,sm8250";
+
+    // kona MTP 19811: DRAM starts at 0x80000000 and the 8 GiB model is one range.
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0 0x80000000 0x2 0x0>;
+    };
+
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+
+        // From kona.dtsi cont_splash_region@9c000000.
+        splash_region: framebuffer@9c000000 {
+            label = "cont_splash_region";
+            reg = <0 0x9c000000 0 0x2300000>;
+            no-map;
+        };
+    };
+};
+
+// Storage. Both nodes ship disabled in the SoC file.
+&ufs { status = "okay"; };
+&ufsphy { status = "okay"; };
+
+// IN2020 factory DTB: CPU0-3 have capacity 1024, CPU4-7 have capacity 1894.
+// The P group contains two EPSS domains. The tags describe scheduling only.
+&cpu0 { unixnu,cluster-type = "E"; };
+&cpu1 { unixnu,cluster-type = "E"; };
+&cpu2 { unixnu,cluster-type = "E"; };
+&cpu3 { unixnu,cluster-type = "E"; };
+&cpu4 { unixnu,cluster-type = "P"; };
+&cpu5 { unixnu,cluster-type = "P"; };
+&cpu6 { unixnu,cluster-type = "P"; };
+&cpu7 { unixnu,cluster-type = "P"; };

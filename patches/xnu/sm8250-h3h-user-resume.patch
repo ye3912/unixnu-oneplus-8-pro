@@ -1,0 +1,156 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -628,9 +628,11 @@
+ #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST
+ 	trust_enabled = 1;
+ #endif
+-	panic("SMUFS root-h3g phase=%s autherr=%d owner_auth=%d require=%d seen%d devfs-errno%d\n"
++	panic("SMUFS root-h3h phase=%s autherr=%d owner_auth=%d require=%d seen%d devfs-errno%d\n"
+ 	      "user seen%u gate%u trap%d cpsr%x esr%x\n"
+ 	      "user pc%llx sp%llx lr%llx\n"
++	      "resume seen%u trap%d cpsr%x esr%x\n"
++	      "resume pc%llx sp%llx lr%llx\n"
+ 	      "mprot enter%u return%u errno%d\n"
+ 	      "mprot addr%llx len%llx prot%x\n"
+ 	      "root %s selected%x mounted%x mount-valid%d vnode%d ro%d flags%llx fs=%s\n"
+@@ -648,6 +650,8 @@
+ 	      boundary, autherr, owner_authorized, require_rootauth, smufs_saved_seen, devfs_error,
+ 	      native_smufs_init_trace.user_seen, __atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE), native_smufs_init_trace.user_trap, native_smufs_init_trace.user_cpsr, native_smufs_init_trace.user_esr,
+ 	      (unsigned long long)native_smufs_init_trace.user_pc, (unsigned long long)native_smufs_init_trace.user_sp, (unsigned long long)native_smufs_init_trace.user_lr,
++	      native_smufs_init_trace.resume_seen, native_smufs_init_trace.resume_trap, native_smufs_init_trace.resume_cpsr, native_smufs_init_trace.resume_esr,
++	      (unsigned long long)native_smufs_init_trace.resume_pc, (unsigned long long)native_smufs_init_trace.resume_sp, (unsigned long long)native_smufs_init_trace.resume_lr,
+ 	      native_smufs_init_trace.mprotect_enter, native_smufs_init_trace.mprotect_return, native_smufs_init_trace.mprotect_error,
+ 	      (unsigned long long)native_smufs_init_trace.mprotect_addr, (unsigned long long)native_smufs_init_trace.mprotect_len, (unsigned)native_smufs_init_trace.mprotect_prot,
+ 	      rootdevice, (uint32_t)rootdev, (uint32_t)mounted_dev, mounted != NULL, rootvnode != NULLVP,
+@@ -683,13 +687,13 @@
+  native_smufs_auth_diag(phase,smufs_saved_autherr,smufs_saved_owner,smufs_saved_require,smufs_saved_devfs);
+ }
+ 
+-/* H3G one-shot witness: publish the matching SVC thread before observing its original mprotect handler. */
++/* H3H one-shot witness: after successful original mprotect, wait for the captured thread to issue another EL0 SVC. */
+ uint32_t native_smufs_init_user_gate;
+ __attribute__((noinline)) void
+ native_smufs_init_user_arm(void)
+ {
+  const struct SmUfsInitTrace *v=&native_smufs_init_trace;
+- if (!v->enabled || (v->selector!=2 && v->selector!=3) || v->stage!=12 || v->exec_enter!=1 || v->exec_return!=1 || v->exec_error || v->signature_enter!=1 || v->signature_return!=1 || v->signature_error) return;
++ if (!v->enabled || (v->selector!=2 && v->selector!=3 && v->selector!=4) || v->stage!=12 || v->exec_enter!=1 || v->exec_return!=1 || v->exec_error || v->signature_enter!=1 || v->signature_return!=1 || v->signature_error) return;
+  uint32_t expected=0;
+  (void)__atomic_compare_exchange_n(&native_smufs_init_user_gate,&expected,1,0,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
+ }
+@@ -698,14 +702,14 @@
+ {
+  if (__atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE)!=1) return;
+  if (proc_getpid(current_proc())!=1 || (cpsr&0x1f)!=0 || ((esr>>26)&0x3f)!=0x15 || !pc || !sp) return;
+- if (native_smufs_init_trace.selector==3 && trap!=74) return;
++ if ((native_smufs_init_trace.selector==3 || native_smufs_init_trace.selector==4) && trap!=74) return;
+  uint32_t expected=1;
+  if (!__atomic_compare_exchange_n(&native_smufs_init_user_gate,&expected,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return;
+  native_smufs_init_trace.user_pc=pc; native_smufs_init_trace.user_sp=sp; native_smufs_init_trace.user_lr=lr;
+  native_smufs_init_trace.user_trap=trap; native_smufs_init_trace.user_cpsr=cpsr; native_smufs_init_trace.user_esr=esr;
+  native_smufs_init_trace.user_seen=1; native_smufs_init_trace.stage=13;
+  native_smufs_init_trace.user_tid=thread_tid(current_thread());
+- if (native_smufs_init_trace.selector==3) {
++ if (native_smufs_init_trace.selector==3 || native_smufs_init_trace.selector==4) {
+   __atomic_store_n(&native_smufs_init_user_gate,3,__ATOMIC_RELEASE);
+   return;
+  }
+@@ -716,7 +720,7 @@
+ native_smufs_init_mprotect_enter(uint64_t addr,uint64_t len,int32_t prot)
+ {
+  if (__atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE)!=3) return 0;
+- if (native_smufs_init_trace.selector!=3 || proc_getpid(current_proc())!=1 || native_smufs_init_trace.user_tid!=thread_tid(current_thread())) return 0;
++ if ((native_smufs_init_trace.selector!=3 && native_smufs_init_trace.selector!=4) || proc_getpid(current_proc())!=1 || native_smufs_init_trace.user_tid!=thread_tid(current_thread())) return 0;
+  uint32_t expected=3;
+  if (!__atomic_compare_exchange_n(&native_smufs_init_user_gate,&expected,4,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 0;
+  native_smufs_init_trace.mprotect_addr=addr; native_smufs_init_trace.mprotect_len=len; native_smufs_init_trace.mprotect_prot=prot;
+@@ -727,11 +731,30 @@
+ native_smufs_init_mprotect_return(int32_t error)
+ {
+  if (__atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE)!=4) return;
+- if (native_smufs_init_trace.selector!=3 || proc_getpid(current_proc())!=1 || native_smufs_init_trace.user_tid!=thread_tid(current_thread())) return;
++ if ((native_smufs_init_trace.selector!=3 && native_smufs_init_trace.selector!=4) || proc_getpid(current_proc())!=1 || native_smufs_init_trace.user_tid!=thread_tid(current_thread())) return;
+  uint32_t expected=4;
+  if (!__atomic_compare_exchange_n(&native_smufs_init_user_gate,&expected,5,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return;
+  native_smufs_init_trace.mprotect_error=error; native_smufs_init_trace.mprotect_return=1; native_smufs_init_trace.stage=15;
++ if (native_smufs_init_trace.selector==4 && !error) {
++  __atomic_store_n(&native_smufs_init_user_gate,6,__ATOMIC_RELEASE);
++  return;
++ }
+  native_smufs_init_diag("mprotect-return",native_smufs_init_trace.exec_error);
++}
++
++__attribute__((noinline)) void
++native_smufs_init_user_resume(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr)
++{
++ if (__atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE)!=6) return;
++ const struct SmUfsInitTrace *v=&native_smufs_init_trace;
++ if (v->selector!=4 || v->stage!=15 || v->mprotect_enter!=1 || v->mprotect_return!=1 || v->mprotect_error || proc_getpid(current_proc())!=1 || v->user_tid!=thread_tid(current_thread())) return;
++ if ((cpsr&0x1f)!=0 || ((esr>>26)&0x3f)!=0x15 || !pc || !sp) return;
++ uint32_t expected=6;
++ if (!__atomic_compare_exchange_n(&native_smufs_init_user_gate,&expected,7,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return;
++ native_smufs_init_trace.resume_pc=pc; native_smufs_init_trace.resume_sp=sp; native_smufs_init_trace.resume_lr=lr;
++ native_smufs_init_trace.resume_trap=trap; native_smufs_init_trace.resume_cpsr=cpsr; native_smufs_init_trace.resume_esr=esr;
++ native_smufs_init_trace.resume_seen=1; native_smufs_init_trace.stage=16;
++ native_smufs_init_diag("user-resumed-svc",native_smufs_init_trace.exec_error);
+ }
+ 
+ void
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8166,7 +8166,7 @@
+   native_smufs_init_trace.exec_return=native_smufs_init_trace.exec_enter;
+   native_smufs_init_trace.exec_error=error;
+   if (native_smufs_init_trace.exec_enter) native_smufs_init_trace.stage=12;
+-  if (!error && (native_smufs_init_trace.selector==2 || native_smufs_init_trace.selector==3)) native_smufs_init_user_arm();
++  if (!error && (native_smufs_init_trace.selector==2 || native_smufs_init_trace.selector==3 || native_smufs_init_trace.selector==4)) native_smufs_init_user_arm();
+   else if (error!=ENOENT) native_smufs_init_diag(native_smufs_init_trace.exec_enter?"init-exec-return":"init-prep-failed",error);
+  }
+  return error;
+@@ -8221,7 +8221,7 @@
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
+ 
+ 	uint32_t smufs_init_selector=0;
+-	if (PE_parse_boot_argn("native-ufs-init-diag",&smufs_init_selector,sizeof(smufs_init_selector)) && (smufs_init_selector==1 || smufs_init_selector==2 || smufs_init_selector==3) && proc_getpid(p)==1) {
++	if (PE_parse_boot_argn("native-ufs-init-diag",&smufs_init_selector,sizeof(smufs_init_selector)) && (smufs_init_selector==1 || smufs_init_selector==2 || smufs_init_selector==3 || smufs_init_selector==4) && proc_getpid(p)==1) {
+ 		native_smufs_init_trace.enabled=1; native_smufs_init_trace.selector=smufs_init_selector;
+ 	}
+ 	kern_return_t smufs_allocation=mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -7,6 +7,9 @@
+  uint32_t selector,user_seen,user_cpsr,user_esr;
+  int32_t user_trap;
+  uint64_t user_pc,user_sp,user_lr,user_tid;
++ uint32_t resume_seen,resume_cpsr,resume_esr;
++ int32_t resume_trap;
++ uint64_t resume_pc,resume_sp,resume_lr;
+  uint32_t mprotect_enter,mprotect_return;
+  int32_t mprotect_error,mprotect_prot;
+  uint64_t mprotect_addr,mprotect_len;
+@@ -21,6 +24,7 @@
+ extern struct SmUfsInitTrace native_smufs_init_trace;
+ extern uint32_t native_smufs_init_user_gate;
+ void native_smufs_init_user_arm(void);
++void native_smufs_init_user_resume(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr);
+ uint32_t native_smufs_init_mprotect_enter(uint64_t addr,uint64_t len,int32_t prot);
+ void native_smufs_init_mprotect_return(int32_t error);
+ void native_smufs_init_user_svc(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr);
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -764,8 +764,13 @@
+ 			panic("Invalid SVC_64 context");
+ 		}
+ 
+-		if (ml_get_interrupts_enabled() && __atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE)==1)
+-			native_smufs_init_user_svc(get_saved_state_pc(state),get_saved_state_sp(state),get_saved_state_lr(state),get_saved_state_svc_number(state),get_saved_state_cpsr(state),esr);
++		if (ml_get_interrupts_enabled()) {
++			uint32_t smufs_user_gate=__atomic_load_n(&native_smufs_init_user_gate,__ATOMIC_ACQUIRE);
++			if (smufs_user_gate==1)
++				native_smufs_init_user_svc(get_saved_state_pc(state),get_saved_state_sp(state),get_saved_state_lr(state),get_saved_state_svc_number(state),get_saved_state_cpsr(state),esr);
++			else if (smufs_user_gate==6)
++				native_smufs_init_user_resume(get_saved_state_pc(state),get_saved_state_sp(state),get_saved_state_lr(state),get_saved_state_svc_number(state),get_saved_state_cpsr(state),esr);
++		}
+ 		handle_svc(state);
+ 		break;
+ 

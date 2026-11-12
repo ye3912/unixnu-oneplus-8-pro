@@ -1,0 +1,65 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1658,14 +1658,15 @@
+     int boot = ml_get_boot_cpu_number();
+     __atomic_store_n(&smufs_cpu_smp, smp, __ATOMIC_RELAXED);
+     __atomic_store_n(&smufs_cpu_boot, boot, __ATOMIC_RELAXED);
+-    /* P2 boundary: sheng-smp alone no longer selects every slot. A secondary is
+-     * published only when sheng-smp-core explicitly selects CPU1. Both the default
+-     * configuration and "sheng-smp without a target" stay single-core. Unselected
+-     * nubs keep their parent attachment and are only withheld from registration.
+-     */
++    // P3 allows a second secondary only with the explicit CPU0/1/4 mask.
++    uint64_t cpumask = 0;
++    bool have_mask = PE_parse_boot_argn("cpumask", &cpumask, sizeof(cpumask)) != 0;
++    bool three_core = have_mask && cpumask == 0x13 &&
++        ml_get_cpu_number(0x100) == 1 && ml_get_cpu_number(0x400) == 2;
+     bool selected = logical >= 0 &&
+         (logical == boot ||
+-         (smp != 0 && have_core && core == 1 && logical == static_cast<int>(core)));
++         (smp != 0 && have_core && core == 1 &&
++          (logical == 1 || (three_core && logical == 2))));
+     if (selected) __atomic_add_fetch(&smufs_cpu_eligible, 1U, __ATOMIC_RELAXED);
+     else {
+         __atomic_add_fetch(&smufs_cpu_withheld, 1U, __ATOMIC_RELAXED);
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -965,18 +965,18 @@
+ 		}
+ #endif
+ #endif /* CONFIG_SPTM */
+-		if (cpu == 1) {
++		if (cpu == 1 || cpu == 2) {
+ 			kprintf("ARMCPU-P2R reset-request cpu=%d affinity=%x handler=%llx\n",
+ 			    cpu, cpu_data_ptr->cpu_phys_id,
+ 			    (unsigned long long)cpu_data_ptr->cpu_reset_handler);
+ 		}
+ 		kern_return_t start_result = PE_cpu_start(cpu_data_ptr->cpu_id, (vm_offset_t)NULL, (vm_offset_t)NULL);
+-		if (cpu == 1) {
++		if (cpu == 1 || cpu == 2) {
+ 			extern volatile uint32_t armcpu_smp_step[8];
+ 			extern volatile int32_t armcpu_smp_psci_rc[8];
+ 			kprintf("ARMCPU-P2R reset-return cpu=%d platform=%d step=%u psci_raw=%d\n",
+-			    cpu, start_result, __atomic_load_n(&armcpu_smp_step[1], __ATOMIC_RELAXED),
+-			    __atomic_load_n(&armcpu_smp_psci_rc[1], __ATOMIC_RELAXED));
++			    cpu, start_result, __atomic_load_n(&armcpu_smp_step[cpu], __ATOMIC_RELAXED),
++			    __atomic_load_n(&armcpu_smp_psci_rc[cpu], __ATOMIC_RELAXED));
+ 		}
+ 	}
+ 
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -737,10 +737,11 @@
+ 	 * drivers use mach_absolute_time() to implement rate control
+ 	 */
+ 	cpu_timebase_init(FALSE);
+-	if (cpu_data_ptr->cpu_number == 1) {
++	if (cpu_data_ptr->cpu_number == 1 || cpu_data_ptr->cpu_number == 2) {
+ 		uint64_t mpidr;
+ 		__asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
+-		kprintf("ARMCPU-P2R entry cpu=1 mpidr=%llx\n", (unsigned long long)mpidr);
++		kprintf("ARMCPU-P2R entry cpu=%u mpidr=%llx\n",
++		    (unsigned)cpu_data_ptr->cpu_number, (unsigned long long)mpidr);
+ 	}
+ 
+ #if KPERF

@@ -1,0 +1,91 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -818,9 +818,11 @@
+ 
+ /* H3J diagnoses SystemOS only. No cache is made executable or passed to dyld. */
+ extern uint32_t smufs_cache_probe_device(uint32_t,uint32_t *,char *,uint64_t *,uint32_t *);
++extern uint32_t smufs_systemos_snapshot(uint64_t *,uint64_t *,uint32_t *);
+ struct SmUfsCacheProbe {
+  uint32_t stage,selected,mounted,matches,postmatches,root_before,root_after,readonly,fs_apfs,root_same;
+  uint32_t mount_enter,mount_return,files,index,main_ok,lib_ok,images,subs;
++ uint32_t mode,system_flags,system_selftests;uint64_t system_checked,system_bad;
+  int mount_error,error;
+  uint64_t media,postmedia;
+  vnode_t original_root;
+@@ -851,20 +853,31 @@
+      vfs_context_ucred(vfs_context_current()),&residual,current_proc());
+  vnode_put(node);return error?error:(residual?EIO:0);
+ }
++__attribute__((noinline)) static uint32_t
++smufs_cache_integrity_valid(struct SmUfsCacheProbe *v,uint32_t require_reads)
++{
++ v->system_flags=smufs_systemos_snapshot(&v->system_checked,&v->system_bad,&v->system_selftests);
++ return v->mode!=2 || (v->system_flags==15 && !v->system_bad &&
++     (require_reads?(v->system_checked>0 && v->system_selftests==15):((v->system_selftests&7)==7)));
++}
+ __attribute__((noinline,noreturn)) static void
+ smufs_cache_probe_report(const char *phase,struct SmUfsCacheProbe *v)
+ {
+- panic("SMUFS cache-h3j phase=%s error=%d stage%u\n"
++ (void)smufs_cache_integrity_valid(v,0);
++ panic("%s phase=%s error=%d stage%u\n"
+        "root before%u after%u same%u autherr%d owner%d\n"
+        "sys selected%x mounted%x matches%u/%u ro%u apfs%u media%llx/%llx\n"
+        "mount %u/%u errno%d path=%s\n"
+        "cache files%u/53 index%u main%u images%u subs%u lib%u\n"
+        "file %.112s\n"
+-       "probe-only1 cache-exec0 sys-integrity0\n",
+-       phase,v->error,v->stage,v->root_before,v->root_after,v->root_same,smufs_saved_autherr,smufs_saved_owner,
++       "policy flags%u self%u/15 units201600 checked%llu bad%llu\n"
++       "probe-only1 cache-exec0 sys-integrity%u\n",
++       v->mode==2?"SMUFS cache-h3k":"SMUFS cache-h3j",phase,v->error,v->stage,v->root_before,v->root_after,v->root_same,smufs_saved_autherr,smufs_saved_owner,
+        v->selected,v->mounted,v->matches,v->postmatches,v->readonly,v->fs_apfs,
+        (unsigned long long)v->media,(unsigned long long)v->postmedia,
+-       v->mount_enter,v->mount_return,v->mount_error,v->device,v->files,v->index,v->main_ok,v->images,v->subs,v->lib_ok,v->file);
++       v->mount_enter,v->mount_return,v->mount_error,v->device,v->files,v->index,v->main_ok,v->images,v->subs,v->lib_ok,v->file,
++       v->system_flags,v->system_selftests,(unsigned long long)v->system_checked,(unsigned long long)v->system_bad,
++       v->mode==2 && v->system_flags==15 && !v->system_bad);
+ }
+ __attribute__((noinline,noreturn)) void
+ native_smufs_cache_probe(uint64_t scratch)
+@@ -872,8 +885,10 @@
+  struct SmUfsCacheProbe *v=kalloc_data(sizeof(*v),Z_WAITOK|Z_ZERO);
+  if(!v)panic("SMUFS cache-h3j allocation failed");
+  v->selected=v->mounted=0xffffffffU;v->original_root=rootvnode;v->stage=1;
++ PE_parse_boot_argn("native-ufs-cache-probe",&v->mode,sizeof(v->mode));
+  v->root_before=smufs_cache_root_valid();
+- if(proc_getpid(current_proc())!=1||!scratch||!v->root_before){v->error=EAUTH;smufs_cache_probe_report("root-refused",v);}
++ if((v->mode!=1&&v->mode!=2)||proc_getpid(current_proc())!=1||!scratch||!v->root_before){v->error=EAUTH;smufs_cache_probe_report("root-refused",v);}
++ if(!smufs_cache_integrity_valid(v,0)){v->error=EAUTH;smufs_cache_probe_report("integrity-policy",v);}
+  v->stage=2;
+  if(!smufs_cache_probe_device(0xffffffffU,&v->selected,v->device,&v->media,&v->matches)){v->error=ENOENT;smufs_cache_probe_report("volume-lookup",v);}
+  /* Existing original APFS mount ABI; scratch is the original user init page. */
+@@ -901,6 +916,7 @@
+  uint32_t bound=smufs_cache_probe_device(v->selected,&fresh,v->postdevice,&v->postmedia,&v->postmatches);
+  v->root_same=rootvnode==v->original_root;v->root_after=smufs_cache_root_valid();
+  if(!v->readonly||!v->fs_apfs||v->mounted!=v->selected||!bound||fresh!=v->selected||v->postmedia!=v->media||!v->root_same||!v->root_after){v->error=EAUTH;smufs_cache_probe_report("mount-binding",v);}
++ if(!smufs_cache_integrity_valid(v,1)){v->error=EAUTH;smufs_cache_probe_report("integrity-after-mount",v);}
+  v->stage=6;
+  for(uint32_t i=0;i<53;++i){
+   v->index=i;int length=snprintf(v->file,sizeof(v->file),"/private/preboot/System/Library/Caches/com.apple.dyld/%s",smufs_cache_expected[i].name);
+@@ -920,7 +936,8 @@
+  }
+  v->stage=7;v->root_same=rootvnode==v->original_root;v->root_after=smufs_cache_root_valid();
+  if(!v->root_same||!v->root_after){v->error=EAUTH;smufs_cache_probe_report("root-recheck",v);}
+- smufs_cache_probe_report("cache-probe-complete",v);
++ if(!smufs_cache_integrity_valid(v,1)){v->error=EAUTH;smufs_cache_probe_report("integrity-after-reads",v);}
++ smufs_cache_probe_report(v->mode==2?"verified-cache-probe-complete":"cache-probe-complete",v);
+ }
+ 
+ 
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8230,7 +8230,7 @@
+ 		if (smufs_allocation || !scratch_addr) native_smufs_init_diag("init-allocate",smufs_allocation?smufs_allocation:ENOMEM);
+ 	}
+ 	uint32_t smufs_cache_selector=0;
+-	if (PE_parse_boot_argn("native-ufs-cache-probe",&smufs_cache_selector,sizeof(smufs_cache_selector)) && smufs_cache_selector==1 && proc_getpid(p)==1) {
++	if (PE_parse_boot_argn("native-ufs-cache-probe",&smufs_cache_selector,sizeof(smufs_cache_selector)) && (smufs_cache_selector==1 || smufs_cache_selector==2) && proc_getpid(p)==1) {
+ 		if (smufs_allocation || !scratch_addr) panic("SMUFS cache-h3j init allocation error %d",smufs_allocation?smufs_allocation:ENOMEM);
+ 		native_smufs_cache_probe((uint64_t)scratch_addr);
+ 	}

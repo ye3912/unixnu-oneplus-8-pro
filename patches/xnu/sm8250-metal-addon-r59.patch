@@ -1,0 +1,93 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1684,3 +1684,41 @@
++extern int sm8250_alioth_metal_register(void);
++
++static void
++sm8250_metal_addon_prepare(uint64_t scratch, vfs_context_t ctx)
++{
++    static const char source[] = "/private/var/ngpu/addons";
++    static const char target[] = "/System/Library/Extensions";
++    static const char *const entries[] = {
++        "/System/Library/Extensions/AGXMetalA10.bundle",
++        "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist",
++    };
++    unsigned stage = 1;
++    int error = kernel_mount("bindfs", NULLVP, NULLVP, target, (void *)source, sizeof(source),
++        MNT_RDONLY | MNT_UNION | MNT_NOSUID | MNT_NODEV, 0, ctx);
++    if (!error) {
++        stage = 2;
++        for (unsigned i = 0; !error && i < sizeof(entries) / sizeof(entries[0]); ++i) {
++            vnode_t entry = NULLVP;
++            error = vnode_lookup(entries[i], VNODE_LOOKUP_NOFOLLOW, &entry, ctx);
++            if (!error) vnode_put(entry);
++        }
++        if (!error) {
++            stage = 3;
++            error = sm8250_alioth_metal_register();
++        }
++        if (error) {
++            struct unmount_args request = {.path = scratch + 0xe00, .flags = 0};
++            int32_t result = 0;
++            int rollback = copyout(target, request.path, sizeof(target));
++            if (!rollback) rollback = unmount(current_proc(), &request, &result);
++            printf("GPU59 addon rollback=%d\n", rollback);
++        } else {
++            stage = 4;
++        }
++    }
++    printf("GPU59 mode12 result status=%x stage=%u\n", error, stage);
++}
++
+ /* The verified factory RAM Data volume supplies a read-only union upper. */
+ static void
+ sm8250_wallpaper_prepare(uint64_t scratch)
+@@ -1693,17 +1731,31 @@
+     uint32_t enabled = 0;
+     if (!PE_parse_boot_argn("sm8250-wallpaper-png", &enabled, sizeof(enabled)) || enabled != 1) return;
+ 
++    uint32_t mode = 0;
++    PE_parse_boot_argn("sm8250-gpu-alioth", &mode, sizeof(mode));
++    const bool metal = mode == 12;
++    const uint64_t wallpaper_bytes = 10637096;
+     const uint8_t *addon = NULL;
+     uint64_t bytes = 0;
+     unsigned stage = 1;
+     int error = EAUTH;
+     if (!smufs_aks_fresh_data_ready() || !scratch || scratch > UINT64_MAX - 4096 ||
+         proc_getpid(current_proc()) != 1 || !native_ram_block_gpu_addon(&addon, &bytes) ||
+-        bytes != 10637096) goto done;
++        (metal ? bytes <= wallpaper_bytes : bytes != wallpaper_bytes)) goto done;
++    // R59 carries the original five compressed wallpaper records first, followed by the signed addon.
++    static const uint8_t wallpaper_header[24] = {
++        'N', 'G', 'P', 'U', 'A', 'D', 'D', '2', 5, 0, 0, 0, 0, 0, 0, 0,
++        0x28, 0x4f, 0xa2, 0, 0, 0, 0, 0,
++    };
+     uint8_t hash[32];
+     SHA256_CTX sha;
+     SHA256_Init(&sha);
+-    SHA256_Update(&sha, addon, bytes);
++    if (metal) {
++        SHA256_Update(&sha, wallpaper_header, sizeof(wallpaper_header));
++        SHA256_Update(&sha, addon + sizeof(wallpaper_header), wallpaper_bytes - sizeof(wallpaper_header));
++    } else {
++        SHA256_Update(&sha, addon, bytes);
++    }
+     SHA256_Final(hash, &sha);
+     if (memcmp(hash, addon_hash, sizeof(hash))) goto done;
+ 
+@@ -1713,11 +1765,12 @@
+     error = smufs_library_verify("/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/main.caml", root, 106340, original_hash);
+     if (error) goto done;
+     native_gpu_addon_install(current_proc(), scratch);
+-    if (native_gpu_addon_files != 5 || native_gpu_addon_failed ||
+-        native_gpu_addon_written + native_gpu_addon_same != 5) {
++    if ((metal ? native_gpu_addon_files < 9 : native_gpu_addon_files != 5) || native_gpu_addon_failed ||
++        native_gpu_addon_written + native_gpu_addon_same != native_gpu_addon_files) {
+         error = native_gpu_addon_error ? native_gpu_addon_error : EIO;
+         goto done;
+     }
++    if (metal) sm8250_metal_addon_prepare(scratch, ctx);
+     stage = 3;
+     error = kernel_mount("bindfs", NULLVP, NULLVP, target, (void *)source, sizeof(source), flags, 0, ctx);
+     if (error) goto done;

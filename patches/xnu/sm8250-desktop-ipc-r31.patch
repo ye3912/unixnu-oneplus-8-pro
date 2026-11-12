@@ -1,0 +1,255 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -128,15 +128,18 @@
+ extern int native_sm_gui_fault_state(uint64_t *, unsigned);
+ 
+ enum { PK30_MAX = 8, PK30_FRAMES = 24 };
++enum pk31_kind { PK31_NONE, PK31_PLUGIN, PK31_ACTIVITY };
+ enum pk30_phase { PK30_REQUEST = 1, PK30_RECV, PK30_REPLY, PK30_DONE };
+ struct pk30_slot {
+ 	ipc_kmsg_t message;
+ 	ipc_port_t reply;
+ 	mach_msg_id_t msgid;
++	enum pk31_kind kind;
+ 	enum pk30_phase phase;
+ };
+ struct pk30_event {
+ 	unsigned slot;
++	enum pk31_kind kind;
+ 	enum pk30_phase phase;
+ };
+ static struct pk30_slot pk30_slots[PK30_MAX];
+@@ -174,7 +177,7 @@
+ 	__atomic_store_n(&pk30_lock, 0, __ATOMIC_RELEASE);
+ }
+ 
+-static bool
++static enum pk31_kind
+ pk30_match(void)
+ {
+ 	static const unsigned char chronod[16] = {
+@@ -207,7 +210,8 @@
+ 	    !native_sm_gui_fault_state(state, 15)) {
+ 		goto unavailable;
+ 	}
+-	const uint64_t expected = 0x1b14199ccULL + slide;
++	const uint64_t plugin = 0x1b14199ccULL + slide;
++	const uint64_t activity = 0x21ca26a1cULL + slide;
+ 	uint64_t frame = state[2], floor = state[3];
+ 	for (unsigned i = 0; i < PK30_FRAMES; i++) {
+ 		uint64_t pair[2];
+@@ -215,8 +219,11 @@
+ 		    frame > UINT64_MAX - sizeof(pair) || copyin(frame, pair, sizeof(pair))) {
+ 			break;
+ 		}
+-		if (pair[1] == expected) {
+-			return true;
++		if (pair[1] == plugin) {
++			return PK31_PLUGIN;
++		}
++		if (pair[1] == activity) {
++			return PK31_ACTIVITY;
+ 		}
+ 		if (pair[0] <= frame) {
+ 			break;
+@@ -226,28 +233,43 @@
+ unavailable:
+ 	unsigned misses = __atomic_add_fetch(&pk30_qual_fail, 1, __ATOMIC_RELAXED);
+ 	if (misses <= 2 || misses == 32) {
+-		printf("PKIPC30 qualifier miss%u pid%d\n", misses, task_pid(current_task()));
++		printf("PKIPC31 qualifier miss%u pid%d\n", misses, task_pid(current_task()));
+ 	}
+ 	return false;
+ }
+ 
+-static int
++struct pk31_owner {
++	const char *state;
++	int pid;
++	unsigned temporary, depth;
++};
++
++static struct pk31_owner
+ pk30_owner(ipc_port_t port)
+ {
+-	int pid = -1;
++	struct pk31_owner owner = { "dead", -1, 0, 0 };
+ 	ip_mq_lock(port);
+-	if (ip_active(port) && !port->ip_tempowner && ip_in_a_space(port)) {
+-		if (ip_in_space(port, ipc_space_kernel)) {
+-			pid = 0;
++	if (ip_active(port)) {
++		owner.temporary = port->ip_tempowner;
++		owner.depth = port->ip_messages.imq_msgcount;
++		if (ip_in_transit(port)) {
++			owner.state = "transit";
++		} else if (ip_in_limbo(port)) {
++			owner.state = "limbo";
++		} else if (ip_in_space(port, ipc_space_kernel)) {
++			owner.state = "kernel";
++			owner.pid = 0;
+ 		} else {
+ 			ipc_space_t space = ip_get_receiver(port);
++			owner.state = "space-no-task";
+ 			if (space && is_active(space) && space->is_task) {
+-				pid = task_pid(space->is_task);
++				owner.state = "user";
++				owner.pid = task_pid(space->is_task);
+ 			}
+ 		}
+ 	}
+ 	ip_mq_unlock(port);
+-	return pid;
++	return owner;
+ }
+ 
+ static struct pk30_event
+@@ -263,15 +285,24 @@
+ 	const mach_msg_id_t msgid = hdr->msgh_id;
+ 	const mach_msg_bits_t bits = hdr->msgh_bits;
+ 
++	enum pk31_kind kind = PK31_NONE;
+ 	if (MACH_MSGH_BITS_LOCAL(bits) == MACH_MSG_TYPE_PORT_SEND_ONCE &&
+-	    IP_VALID(reply) && IP_VALID(dest) && pk30_match()) {
++	    IP_VALID(reply) && IP_VALID(dest)) {
++		kind = pk30_match();
++	}
++	if (kind != PK31_NONE) {
+ 		ip_reference(reply);
+ 		if (pk30_enter()) {
+-			unsigned index = __atomic_load_n(&pk30_used, __ATOMIC_RELAXED);
+-			if (index < PK30_MAX) {
+-				pk30_slots[index] = (struct pk30_slot){ kmsg, reply, msgid, PK30_REQUEST };
+-				__atomic_store_n(&pk30_used, index + 1, __ATOMIC_RELAXED);
+-				event = (struct pk30_event){ index + 1, PK30_REQUEST };
++			/* Reserve half the trace for each call site. Slots are never reused. */
++			unsigned index = kind == PK31_PLUGIN ? 0 : PK30_MAX / 2;
++			unsigned end = index + PK30_MAX / 2;
++			while (index < end && pk30_slots[index].kind != PK31_NONE) {
++				index++;
++			}
++			if (index < end) {
++				pk30_slots[index] = (struct pk30_slot){ kmsg, reply, msgid, kind, PK30_REQUEST };
++				__atomic_store_n(&pk30_used, 1, __ATOMIC_RELAXED);
++				event = (struct pk30_event){ index + 1, kind, PK30_REQUEST };
+ 			} else {
+ 				__atomic_add_fetch(&pk30_saturated, 1, __ATOMIC_RELAXED);
+ 			}
+@@ -283,7 +314,7 @@
+ 	} else if (MACH_MSGH_BITS_REMOTE(bits) == MACH_MSG_TYPE_PORT_SEND_ONCE &&
+ 	    __atomic_load_n(&pk30_used, __ATOMIC_RELAXED) && pk30_enter()) {
+ 		unsigned found = PK30_MAX, matches = 0;
+-		for (unsigned i = 0; i < __atomic_load_n(&pk30_used, __ATOMIC_RELAXED); i++) {
++		for (unsigned i = 0; i < PK30_MAX; i++) {
+ 			if (pk30_slots[i].reply == dest && pk30_slots[i].phase == PK30_RECV) {
+ 				found = i;
+ 				matches++;
+@@ -293,14 +324,15 @@
+ 			pk30_slots[found].message = kmsg;
+ 			pk30_slots[found].msgid = msgid;
+ 			pk30_slots[found].phase = PK30_REPLY;
+-			event = (struct pk30_event){ found + 1, PK30_REPLY };
++			event = (struct pk30_event){ found + 1, pk30_slots[found].kind, PK30_REPLY };
+ 		}
+ 		pk30_leave();
+ 	}
+ 	if (event.slot) {
+-		printf("PKIPC30 send slot%u phase%u pid%d owner%d msgid%x tid%llu\n",
+-		    event.slot, event.phase, task_pid(current_task()), pk30_owner(dest),
+-		    (unsigned)msgid, current_thread()->thread_id);
++		struct pk31_owner owner = pk30_owner(dest);
++		printf("PKIPC31 send slot%u kind%u phase%u pid%d owner%d state%s temporary%u depth%u msgid%x tid%llu\n",
++		    event.slot, event.kind, event.phase, task_pid(current_task()), owner.pid,
++		    owner.state, owner.temporary, owner.depth, (unsigned)msgid, current_thread()->thread_id);
+ 	}
+ 	return event;
+ }
+@@ -313,14 +345,14 @@
+ 		return event;
+ 	}
+ 	mach_msg_header_t *hdr = ikm_header(kmsg);
+-	for (unsigned i = 0; i < __atomic_load_n(&pk30_used, __ATOMIC_RELAXED); i++) {
++	for (unsigned i = 0; i < PK30_MAX; i++) {
+ 		struct pk30_slot *slot = &pk30_slots[i];
+ 		if (slot->message != kmsg || slot->msgid != hdr->msgh_id) {
+ 			continue;
+ 		}
+ 		if ((slot->phase == PK30_REQUEST && slot->reply == hdr->msgh_local_port) ||
+ 		    (slot->phase == PK30_REPLY && slot->reply == hdr->msgh_remote_port)) {
+-			event = (struct pk30_event){ i + 1, slot->phase };
++			event = (struct pk30_event){ i + 1, slot->kind, slot->phase };
+ 			slot->message = IKM_NULL;
+ 			break;
+ 		}
+@@ -357,15 +389,19 @@
+ 		static const unsigned char pkd[16] = {
+ 			0x43,0x21,0x8c,0x16,0x2f,0xa7,0x33,0x9d,0xad,0x93,0x94,0x65,0x46,0x83,0xe3,0xb3
+ 		};
++		static const unsigned char liveactivity[16] = {
++			0x93,0x2d,0x7c,0xa3,0x17,0x03,0x36,0x18,0xb8,0xe6,0x8b,0xac,0x41,0xf8,0x57,0x5f
++		};
+ 		struct proc *proc = get_bsdtask_info(current_task());
+ 		unsigned char uuid[16] = {};
+ 		if (proc) {
+ 			proc_getexecutableuuid(proc, uuid, sizeof(uuid));
+ 		}
+-		printf("PKIPC30 peer slot%u pid%d pkd-uuid-match%u\n",
+-		    event.slot, task_pid(current_task()), (unsigned)(memcmp(uuid, pkd, sizeof(uuid)) == 0));
+-	}
+-	printf("PKIPC30 %s slot%u phase%u pid%d tid%llu status%x contention%u qualfail%u saturated%u\n",
++		printf("PKIPC31 peer slot%u kind%u pid%d pkd-match%u liveactivitiesd-match%u\n",
++		    event.slot, event.kind, task_pid(current_task()), (unsigned)(memcmp(uuid, pkd, sizeof(uuid)) == 0),
++		    (unsigned)(memcmp(uuid, liveactivity, sizeof(uuid)) == 0));
++	}
++	printf("PKIPC31 %s slot%u phase%u pid%d tid%llu status%x contention%u qualfail%u saturated%u\n",
+ 	    received ? "receive" : "result", event.slot, event.phase,
+ 	    task_pid(current_task()), current_thread()->thread_id, (unsigned)status,
+ 	    __atomic_load_n(&pk30_contention, __ATOMIC_RELAXED),
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2223,6 +2223,8 @@
+ 	int itercount = 0;
+ #if DEVELOPMENT || DEBUG
+  unsigned chrono_event=0;
++ unsigned peer_event=0;
++ unsigned peer_kind=0;
+ #endif
+ 	proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+ 
+@@ -2261,6 +2263,27 @@
+   }
+  }
+ #endif
++#if DEVELOPMENT || DEBUG
++ if(!strcmp(excpath,"/usr/libexec/pkd"))peer_kind=1;
++ else if(!strcmp(excpath,"/System/Library/PrivateFrameworks/SessionCore.framework/Support/liveactivitiesd"))peer_kind=2;
++ if(peer_kind) {
++  static unsigned peer_attempts[2];
++  unsigned enabled=0;
++  PE_parse_boot_argn("plugin-ipc-diag",&enabled,sizeof(enabled));
++  if(enabled==1) {
++   unsigned *counter=&peer_attempts[peer_kind-1];
++   unsigned count=__atomic_load_n(counter,__ATOMIC_RELAXED);
++   while(count<8) {
++    if(__atomic_compare_exchange_n(counter,&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {
++     peer_event=count+1;
++     printf("PKLIFE31 attempt kind%u event%u caller%d target%d\n",
++       peer_kind,peer_event,proc_getpid(current_proc()),proc_getpid(p));
++     break;
++    }
++   }
++  }
++ }
++#endif
+ 	/* Use excpath, which contains the copyin-ed exec path */
+ 	DTRACE_PROC1(exec, uintptr_t, excpath);
+ 
+@@ -2425,6 +2448,8 @@
+ 	kfree_type(struct nameidata, ndp);
+ 
+ #if DEVELOPMENT || DEBUG
++ if(peer_event)printf("PKLIFE31 result kind%u event%u target%d errno%d\n",
++  peer_kind,peer_event,proc_getpid(p),error);
+  if(chrono_event)printf("CHRONO27 exec result%u pid%d errno%d\n",chrono_event,proc_getpid(p),error);
+ #endif
+ 	return error;

@@ -1,0 +1,608 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -563,9 +563,40 @@
+ }
+ #endif
+ 
++#include <sys/smufs_root_trace.h>
++
++/* Terminal board probe: no allocator, constructor, printing or blocking lock. */
++static SmUfsRootTraceState smufs_root_trace_state;
++static uint32_t smufs_root_trace_gate;
++
++__attribute__((noinline)) void native_smufs_root_trace_emit(uint32_t event, uint32_t arg, uint32_t kind,
++    int32_t result, uint32_t dev_valid, uint32_t dev)
++{
++    uint32_t gate = __atomic_load_n(&smufs_root_trace_gate, __ATOMIC_ACQUIRE);
++    if (!gate) {
++        uint32_t level = 0;
++        PE_parse_boot_argn("native-ufs-probe", &level, sizeof(level));
++        gate = level == 70 ? 2 : 1;
++        if (gate == 2) {
++            __atomic_store_n(&smufs_root_trace_state.version, SMUFS_RT_CORE_VERSION, __ATOMIC_RELAXED);
++            __atomic_store_n(&smufs_root_trace_state.enabled, 1, __ATOMIC_RELEASE);
++        }
++        __atomic_store_n(&smufs_root_trace_gate, gate, __ATOMIC_RELEASE);
++    }
++    if (gate == 2) smufs_rt_core_emit(&smufs_root_trace_state, event, arg, kind, result, dev_valid, dev);
++}
++
++uint32_t native_smufs_root_trace_snapshot(SmUfsRootTraceSnapshot *out)
++{
++    if (!out) return 0;
++    return smufs_rt_core_snapshot(&smufs_root_trace_state, out);
++}
++
+ void
+ bsd_init(void)
+ {
++	native_smufs_root_trace_emit(SMRT_BSD_ENTER, 0, SMRT_NONE, 0, 0, 0);
++
+ 	struct uthread *ut;
+ 	vnode_t init_rootvnode = NULLVP;
+ 	struct proc_ro_data kernproc_ro_data = {
+@@ -919,6 +950,7 @@
+ 	}
+ #endif
+ 
++	native_smufs_root_trace_emit(SMRT_AUTOCONF_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
+ 	bsd_autoconf();
+ 
+@@ -1006,13 +1038,18 @@
+ 		int err;
+ 
+ 		bsd_init_kprintf("calling setconf\n");
++		native_smufs_root_trace_emit(SMRT_SETCONF_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 		setconf();
++		native_smufs_root_trace_emit(SMRT_SETCONF_RETURN, 0, SMRT_FLAGS, 0, rootdev != NODEV, (uint32_t)rootdev);
+ #if CONFIG_NETBOOT
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+ 
+ 		bsd_init_kprintf("vfs_mountroot\n");
+-		if (0 == (err = vfs_mountroot())) {
++		native_smufs_root_trace_emit(SMRT_MOUNT_ENTER, 0, SMRT_NONE, 0, rootdev != NODEV, (uint32_t)rootdev);
++		err = vfs_mountroot();
++		native_smufs_root_trace_emit(SMRT_MOUNT_RETURN, 0, SMRT_ERRNO, err, rootdev != NODEV, (uint32_t)rootdev);
++		if (err == 0) {
+ 			break;
+ 		}
+ 		rootdevice[0] = '\0';
+@@ -1032,13 +1069,18 @@
+ 		printf("cannot mount root, errno = %d\n", err);
+ 	}
+ 
++	native_smufs_root_trace_emit(SMRT_SECURE_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 	IOSecureBSDRoot(rootdevice);
++	native_smufs_root_trace_emit(SMRT_SECURE_RETURN, 0, SMRT_NONE, 0, 0, 0);
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+ 
+ 	bsd_init_kprintf("calling VFS_ROOT\n");
+ 	/* Get the vnode for '/'.  Set fdp->fd_fd.fd_cdir to reference it. */
+-	if (VFS_ROOT(mountlist.tqh_first, &init_rootvnode, vfs_context_kernel())) {
++	native_smufs_root_trace_emit(SMRT_VFSROOT_ENTER, 0, SMRT_NONE, 0, 0, 0);
++	int smufs_root_error = VFS_ROOT(mountlist.tqh_first, &init_rootvnode, vfs_context_kernel());
++	native_smufs_root_trace_emit(SMRT_VFSROOT_RETURN, 0, SMRT_ERRNO, smufs_root_error, 0, 0);
++	if (smufs_root_error) {
+ 		panic("bsd_init: cannot find root vnode: %s", PE_boot_args());
+ 	}
+ 	(void)vnode_ref(init_rootvnode);
+@@ -1047,6 +1089,7 @@
+ 	lck_rw_lock_exclusive(&rootvnode_rw_lock);
+ 	set_rootvnode(init_rootvnode);
+ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
++	native_smufs_root_trace_emit(SMRT_ROOT_PUBLISHED, 0, SMRT_PRESENT, rootvnode != NULL, rootdev != NODEV, (uint32_t)rootdev);
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
+ 
+ 
+@@ -1065,7 +1108,9 @@
+ 
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
++			native_smufs_root_trace_emit(SMRT_AUTH_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
++			native_smufs_root_trace_emit(SMRT_AUTH_RETURN, 0, SMRT_ERRNO, autherr, 0, 0);
+ 			int owner_authorized = 0;
+ #if defined(XNU_OWNER_ROOT_AUDIT) && XNU_OWNER_ROOT_AUDIT
+ 			{
+@@ -1152,7 +1197,9 @@
+ 		char mounthere[] = "/dev"; /* !const because of internal casting */
+ 
+ 		bsd_init_kprintf("calling devfs_kernel_mount\n");
+-		devfs_kernel_mount(mounthere);
++		native_smufs_root_trace_emit(SMRT_DEVFS_ENTER, 0, SMRT_NONE, 0, 0, 0);
++		int smufs_devfs_error = devfs_kernel_mount(mounthere);
++		native_smufs_root_trace_emit(SMRT_DEVFS_RETURN, 0, SMRT_ERRNO, smufs_devfs_error, 0, 0);
+ 	}
+ #endif /* DEVFS */
+ 
+@@ -1223,6 +1270,7 @@
+ 	machine_timeout_bsd_init();
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++	native_smufs_root_trace_emit(SMRT_BSD_RETURN, 0, SMRT_NONE, 0, 0, 0);
+ 	bsd_init_kprintf("done\n");
+ }
+ 
+@@ -1286,7 +1334,9 @@
+ bsd_autoconf(void)
+ {
+ 	kprintf("bsd_autoconf: calling kminit\n");
++	native_smufs_root_trace_emit(SMRT_KMINIT_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 	kminit();
++	native_smufs_root_trace_emit(SMRT_KMINIT_RETURN, 0, SMRT_NONE, 0, 0, 0);
+ 
+ 	/*
+ 	 * Early startup for bsd pseudodevices.
+@@ -1299,7 +1349,10 @@
+ 		}
+ 	}
+ 
++	native_smufs_root_trace_emit(SMRT_PSEUDO_DONE, 0, SMRT_NONE, 0, 0, 0);
++	native_smufs_root_trace_emit(SMRT_IOBSD_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 	kern_return_t result = IOKitBSDInit();
++	native_smufs_root_trace_emit(SMRT_IOBSD_RETURN, 0, SMRT_KERN, result, 0, 0);
+ #if (DEVELOPMENT || DEBUG) && defined(XNU_NATIVE_LEGACY_DISPLAY) && XNU_NATIVE_LEGACY_DISPLAY
+ 	/* The original IOSurface personality requires the genuine IOBSD resource.
+ 	 * The default-off framebuffer instrument may start only after publication.
+@@ -1320,10 +1373,12 @@
+ 	kern_return_t   err;
+ 
+ 	err = IOFindBSDRoot(rootdevice, sizeof(rootdevice), &rootdev, &flags);
++	native_smufs_root_trace_emit(SMRT_FIND_CALL_RETURN, 0, SMRT_KERN, err, err == 0 && rootdev != NODEV, (uint32_t)rootdev);
+ 	if (err) {
+ 		printf("setconf: IOFindBSDRoot returned an error (%d);"
+ 		    "setting rootdevice to 'sd0a'.\n", err);     /* XXX DEBUG TEMP */
+ 		rootdev = makedev( 6, 0 );
++		native_smufs_root_trace_emit(SMRT_FALLBACK, 0, SMRT_NONE, 0, 1, (uint32_t)rootdev);
+ 		strlcpy(rootdevice, "sd0a", sizeof(rootdevice));
+ 		flags = 0;
+ 	}
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -107,10 +107,14 @@
+ thread_call_t corefile_open_call = NULL;
+ #endif
+ 
++#include <sys/smufs_root_trace.h>
++
+ kern_return_t
+ IOKitBSDInit( void )
+ {
++	native_smufs_root_trace_emit(SMRT_IOBSD_PUBLISH_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 	IOService::publishResource("IOBSD");
++	native_smufs_root_trace_emit(SMRT_IOBSD_PUBLISH_RETURN, 0, SMRT_NONE, 0, 0, 0);
+ 
+ #if IOPOLLED_COREFILE
+ 	corefile_open_call = thread_call_allocate_with_options(IOOpenPolledCoreFile, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+@@ -751,6 +755,9 @@
+ 	const char *        uuidStr = NULL;
+ 
+ 	static int          mountAttempts = 0;
++	uint32_t smufs_match = SMRT_MATCH_UNKNOWN, smufs_inputs = 0, smufs_properties = 0;
++	uint32_t smufs_selected_valid = 0;
++	native_smufs_root_trace_emit(SMRT_FIND_ENTER, mountAttempts + 1, SMRT_NONE, 0, 0, 0);
+ 
+ 	int xchar, dchar;
+ 
+@@ -759,7 +766,10 @@
+ 	assert(matching);
+ 	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
+ 
+-	if ((service = IOService::waitForMatchingService(matching, 30ULL * kSecondScale))) {
++	native_smufs_root_trace_emit(SMRT_RESOURCE_ENTER, 0, SMRT_NONE, 0, 0, 0);
++	service = IOService::waitForMatchingService(matching, 30ULL * kSecondScale);
++	native_smufs_root_trace_emit(SMRT_RESOURCE_RETURN, 0, SMRT_PRESENT, service != NULL, 0, 0);
++	if (service) {
+ 		OSSafeReleaseNULL(service);
+ 	} else {
+ 		IOLog("!BSD\n");
+@@ -774,12 +784,16 @@
+ 
+ 	str = OSDataAllocation<char>( kMaxPathBuf + kMaxBootVar, OSAllocateMemory );
+ 	if (!str) {
++		native_smufs_root_trace_emit(SMRT_FIND_RETURN, 0, SMRT_KERN, kIOReturnNoMemory, 0, 0);
+ 		return kIOReturnNoMemory;
+ 	}
+ 	rdBootVar = str.data() + kMaxPathBuf;
+ 
+-	if (!PE_parse_boot_argn("rd", rdBootVar, kMaxBootVar )
+-	    && !PE_parse_boot_argn("rootdev", rdBootVar, kMaxBootVar )) {
++	if (PE_parse_boot_argn("rd", rdBootVar, kMaxBootVar)) {
++		smufs_inputs |= SMRT_INPUT_RD;
++	} else if (PE_parse_boot_argn("rootdev", rdBootVar, kMaxBootVar)) {
++		smufs_inputs |= SMRT_INPUT_ROOTDEV;
++	} else {
+ 		rdBootVar[0] = 0;
+ 	}
+ 
+@@ -789,9 +803,11 @@
+ 			OSObject* unserializedContainer = NULL;
+ 			data = OSDynamicCast(OSData, regEntry->getProperty( "root-matching" ));
+ 			if (data) {
++				smufs_inputs |= SMRT_INPUT_CHOSEN;
+ 				unserializedContainer = OSUnserializeXML((char *)data->getBytesNoCopy());
+ 				matching = OSDynamicCast(OSDictionary, unserializedContainer);
+ 				if (matching) {
++					smufs_match = SMRT_MATCH_CHOSEN;
+ 					continue;
+ 				}
+ 			}
+@@ -799,6 +815,7 @@
+ 
+ 			data = (OSData *) regEntry->getProperty( "boot-uuid" );
+ 			if (data) {
++				smufs_inputs |= SMRT_INPUT_DT_UUID;
+ 				uuidStr = (const char*)data->getBytesNoCopy();
+ 				OSString *uuidString = OSString::withCString( uuidStr );
+ 
+@@ -808,6 +825,7 @@
+ 					IOService::publishResource( "boot-uuid", uuidString );
+ 					uuidString->release();
+ 					matching = IOUUIDMatching();
++					smufs_match = SMRT_MATCH_DT_UUID;
+ 					mediaProperty = "boot-uuid-media";
+ 					continue;
+ 				} else {
+@@ -879,6 +897,11 @@
+ 				}
+ #endif
+ 
++				smufs_match = SMRT_MATCH_MEMORY;
++				smufs_selected_valid = 1;
++				native_smufs_root_trace_emit(SMRT_INPUTS, smufs_inputs, SMRT_NONE, 0, 0, 0);
++				native_smufs_root_trace_emit(SMRT_MATCH_SOURCE, smufs_match, SMRT_NONE, 0, 0, 0);
++				native_smufs_root_trace_emit(SMRT_SELECTED, 0, SMRT_FLAGS, 0, 1, (uint32_t)*root);
+ 				goto iofrootx;                                                                  /* Join common exit... */
+ 			}
+ 			panic("IOFindBSDRoot: specified root memory device, %s, has not been configured", rdBootVar); /* Not there */
+@@ -894,6 +917,7 @@
+ 
+ 		if (strncmp( look, "en", strlen( "en" )) == 0) {
+ 			matching = IONetworkNamePrefixMatching( "en" );
++			smufs_match = SMRT_MATCH_NETWORK;
+ 			needNetworkKexts = true;
+ 		} else if (strncmp( look, "uuid", strlen( "uuid" )) == 0) {
+ 			OSDataAllocation<char> uuid( kMaxBootVar, OSAllocateMemory );
+@@ -904,17 +928,20 @@
+ 				if (!PE_parse_boot_argn( "boot-uuid", uuid.data(), kMaxBootVar )) {
+ 					panic( "rd=uuid but no boot-uuid=<value> specified" );
+ 				}
++				smufs_inputs |= SMRT_INPUT_BOOT_UUID;
+ 				uuidString = OSString::withCString(uuid.data());
+ 				if (uuidString) {
+ 					IOService::publishResource( "boot-uuid", uuidString );
+ 					uuidString->release();
+ 					IOLog("\nWaiting for boot volume with UUID %s\n", uuid.data());
+ 					matching = IOUUIDMatching();
++					smufs_match = SMRT_MATCH_ARG_UUID;
+ 					mediaProperty = "boot-uuid-media";
+ 				}
+ 			}
+ 		} else {
+ 			matching = IOBSDNameMatching( look );
++			smufs_match = SMRT_MATCH_BSDNAME;
+ 		}
+ 	}
+ 
+@@ -923,6 +950,7 @@
+ 		// Match any HFS media
+ 
+ 		matching = IOService::serviceMatching( "IOMedia" );
++		smufs_match = SMRT_MATCH_HFS;
+ 		assert(matching);
+ 		astring = OSString::withCStringNoCopy("Apple_HFS");
+ 		if (astring) {
+@@ -931,9 +959,13 @@
+ 		}
+ 	}
+ 
++	native_smufs_root_trace_emit(SMRT_INPUTS, smufs_inputs, SMRT_NONE, 0, 0, 0);
++	native_smufs_root_trace_emit(SMRT_MATCH_SOURCE, smufs_match, SMRT_NONE, 0, 0, 0);
+ 	if (gIOKitDebug & kIOWaitQuietBeforeRoot) {
+ 		IOLog( "Waiting for matching to complete\n" );
++		native_smufs_root_trace_emit(SMRT_QUIET_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 		IOService::getPlatform()->waitQuiet();
++		native_smufs_root_trace_emit(SMRT_QUIET_RETURN, 0, SMRT_NONE, 0, 0, 0);
+ 	}
+ 
+ 	if (matching) {
+@@ -955,7 +987,9 @@
+ 		t.tv_sec = ROOTDEVICETIMEOUT;
+ 		t.tv_nsec = 0;
+ 		matching->retain();
++		native_smufs_root_trace_emit(SMRT_ROOT_WAIT_ENTER, mountAttempts, SMRT_NONE, 0, 0, 0);
+ 		service = IOService::waitForService( matching, &t );
++		native_smufs_root_trace_emit(SMRT_ROOT_WAIT_RETURN, mountAttempts, SMRT_PRESENT, service != NULL, 0, 0);
+ 		if ((!service) || (mountAttempts == 10)) {
+ #if !XNU_TARGET_OS_OSX || !defined(__arm64__)
+ 			PE_display_icon( 0, "noroot");
+@@ -990,6 +1024,7 @@
+ 
+ 	if (service && mediaProperty) {
+ 		service = (IOService *)service->getProperty(mediaProperty);
++		native_smufs_root_trace_emit(SMRT_MEDIA_RESOLVED, 0, SMRT_PRESENT, service != NULL, 0, 0);
+ 	}
+ 
+ 	mjr = 0;
+@@ -1012,14 +1047,17 @@
+ 
+ 		iostr = (OSString *) service->getProperty( kIOBSDNameKey );
+ 		if (iostr) {
++			smufs_properties |= 1;
+ 			strlcpy( rootName, iostr->getCStringNoCopy(), rootNameSize );
+ 		}
+ 		off = (OSNumber *) service->getProperty( kIOBSDMajorKey );
+ 		if (off) {
++			smufs_properties |= 2;
+ 			mjr = off->unsigned32BitValue();
+ 		}
+ 		off = (OSNumber *) service->getProperty( kIOBSDMinorKey );
+ 		if (off) {
++			smufs_properties |= 4;
+ 			mnr = off->unsigned32BitValue();
+ 		}
+ 
+@@ -1041,10 +1079,15 @@
+ 
+ 	*root = makedev( mjr, mnr );
+ 	*oflags = flags;
++	smufs_selected_valid = service != NULL && smufs_properties == 7;
++	native_smufs_root_trace_emit(SMRT_BSD_PROPERTIES, smufs_properties, SMRT_NONE, 0, 0, 0);
++	native_smufs_root_trace_emit(SMRT_SELECTED, smufs_match, SMRT_FLAGS, flags, smufs_selected_valid, (uint32_t)*root);
+ 
+ iofrootx:
+ 
++	native_smufs_root_trace_emit(SMRT_ROOTMEDIA_ENTER, 0, SMRT_PRESENT, service != NULL, 0, 0);
+ 	IOService::setRootMedia(service);
++	native_smufs_root_trace_emit(SMRT_ROOTMEDIA_RETURN, 0, SMRT_NONE, 0, 0, 0);
+ 
+ 	if ((gIOKitDebug & (kIOLogDTree | kIOLogServiceTree | kIOLogMemory)) && !debugInfoPrintedOnce) {
+ 		IOService::getPlatform()->waitQuiet();
+@@ -1061,6 +1104,7 @@
+ 		}
+ 	}
+ 
++	native_smufs_root_trace_emit(SMRT_FIND_RETURN, 0, SMRT_KERN, kIOReturnSuccess, smufs_selected_valid, (uint32_t)*root);
+ 	return kIOReturnSuccess;
+ }
+ 
+--- a/bsd/sys/Makefile
++++ b/bsd/sys/Makefile
+@@ -229,6 +229,8 @@
+ 	lockdown_mode.h \
+ 
+ XNU_ONLY_EXPORTS = \
++	smufs_root_trace.h \
++	smufs_root_trace_core.h \
+ 	bsdtask_info.h \
+ 	file_internal.h \
+ 	filedesc.h \
+--- /dev/null
++++ b/bsd/sys/smufs_root_trace.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++#pragma once
++#include <sys/smufs_root_trace_core.h>
++
++enum SmUfsRootTraceEvent {
++	SMRT_AUTOCONF_ENTER = 1, SMRT_KMINIT_ENTER, SMRT_KMINIT_RETURN, SMRT_PSEUDO_DONE,
++	SMRT_IOBSD_ENTER, SMRT_IOBSD_RETURN, SMRT_SETCONF_ENTER, SMRT_SETCONF_RETURN,
++	SMRT_FIND_ENTER, SMRT_RESOURCE_ENTER, SMRT_RESOURCE_RETURN, SMRT_INPUTS,
++	SMRT_MATCH_SOURCE, SMRT_QUIET_ENTER, SMRT_QUIET_RETURN, SMRT_ROOT_WAIT_ENTER,
++	SMRT_ROOT_WAIT_RETURN, SMRT_MEDIA_RESOLVED, SMRT_SELECTED, SMRT_ROOTMEDIA_ENTER,
++	SMRT_ROOTMEDIA_RETURN, SMRT_FIND_RETURN, SMRT_FIND_CALL_RETURN, SMRT_FALLBACK,
++	SMRT_MOUNT_ENTER, SMRT_MOUNT_RETURN, SMRT_SECURE_ENTER, SMRT_SECURE_RETURN,
++	SMRT_VFSROOT_ENTER, SMRT_VFSROOT_RETURN, SMRT_ROOT_PUBLISHED,
++	SMRT_AUTH_ENTER, SMRT_AUTH_RETURN, SMRT_DEVFS_ENTER, SMRT_DEVFS_RETURN,
++	SMRT_BSD_ENTER, SMRT_BSD_RETURN, SMRT_IOBSD_PUBLISH_ENTER, SMRT_IOBSD_PUBLISH_RETURN,
++	SMRT_BSD_PROPERTIES
++};
++enum SmUfsRootTraceKind { SMRT_NONE = 0, SMRT_KERN = 1, SMRT_ERRNO = 2, SMRT_PRESENT = 3, SMRT_FLAGS = 4 };
++enum SmUfsRootTraceMatch { SMRT_MATCH_UNKNOWN = 0, SMRT_MATCH_CHOSEN = 1,
++	SMRT_MATCH_DT_UUID = 2, SMRT_MATCH_MEMORY = 3, SMRT_MATCH_NETWORK = 4,
++	SMRT_MATCH_ARG_UUID = 5, SMRT_MATCH_BSDNAME = 6, SMRT_MATCH_HFS = 7 };
++enum SmUfsRootTraceInput { SMRT_INPUT_RD = 1, SMRT_INPUT_ROOTDEV = 2,
++	SMRT_INPUT_CHOSEN = 4, SMRT_INPUT_DT_UUID = 8, SMRT_INPUT_BOOT_UUID = 16 };
++#ifdef __cplusplus
++extern "C" {
++#endif
++void native_smufs_root_trace_emit(uint32_t event, uint32_t arg, uint32_t kind,
++                                  int32_t result, uint32_t dev_valid, uint32_t dev);
++uint32_t native_smufs_root_trace_snapshot(SmUfsRootTraceSnapshot *out);
++#ifdef __cplusplus
++}
++#endif
+--- /dev/null
++++ b/bsd/sys/smufs_root_trace_core.h
+@@ -0,0 +1,188 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#pragma once
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define SMUFS_RT_CORE_VERSION 1u
++#define SMUFS_RT_EVENT_CAPACITY 64u
++#define SMUFS_RT_FIRST_EVENT 1u
++#define SMUFS_RT_LAST_EVENT (SMUFS_RT_EVENT_CAPACITY - 1u)
++#define SMUFS_RT_SNAPSHOT_RETRIES 4u
++
++typedef struct SmUfsRootTraceRecord {
++    uint32_t count;
++    uint32_t sequence;
++    uint32_t arg;
++    uint32_t result_kind;
++    int32_t result;
++    uint32_t dev_valid;
++    uint32_t dev;
++} SmUfsRootTraceRecord;
++
++typedef struct SmUfsRootTraceState {
++    uint32_t enabled;
++    uint32_t version;
++    uint32_t sequence;
++    uint32_t writes;
++    uint32_t lost;
++    uint32_t writer_lock[SMUFS_RT_EVENT_CAPACITY];
++    SmUfsRootTraceRecord records[SMUFS_RT_EVENT_CAPACITY];
++} SmUfsRootTraceState;
++
++typedef struct SmUfsRootTraceSnapshot {
++    uint32_t enabled;
++    uint32_t version;
++    uint32_t sequence;
++    uint32_t writes;
++    uint32_t lost;
++    uint32_t partial;
++    SmUfsRootTraceRecord records[SMUFS_RT_EVENT_CAPACITY];
++} SmUfsRootTraceSnapshot;
++
++static inline uint32_t smufs_rt_core_increment(uint32_t *counter)
++{
++    uint32_t value = __atomic_load_n(counter, __ATOMIC_RELAXED);
++    for (uint32_t attempt = 0u; attempt < 4u; ++attempt) {
++        if (value == UINT32_MAX) return 0u;
++        const uint32_t next = value + 1u;
++        if (__atomic_compare_exchange_n(counter, &value, next, 1,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return next;
++    }
++    return 0u;
++}
++
++static inline void smufs_rt_core_lost(SmUfsRootTraceState *state)
++{
++    // UINT32_MAX means a saturated count or contention prevented exact accounting.
++    if (!smufs_rt_core_increment(&state->lost)) {
++        __atomic_store_n(&state->lost, UINT32_MAX, __ATOMIC_RELEASE);
++    }
++}
++
++static inline void smufs_rt_core_emit(SmUfsRootTraceState *state,
++                                       uint32_t event_id,
++                                       uint32_t arg,
++                                       uint32_t result_kind,
++                                       int32_t result,
++                                       uint32_t dev_valid,
++                                       uint32_t dev)
++{
++    if (state == (SmUfsRootTraceState *)0 ||
++        __atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE) == 0u) {
++        return;
++    }
++    if (event_id < SMUFS_RT_FIRST_EVENT || event_id > SMUFS_RT_LAST_EVENT) {
++        smufs_rt_core_lost(state);
++        return;
++    }
++
++    uint32_t expected = 0u;
++    if (!__atomic_compare_exchange_n(&state->writer_lock[event_id], &expected, 1u,
++                                     1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++        smufs_rt_core_lost(state);
++        return;
++    }
++
++    SmUfsRootTraceRecord *record = &state->records[event_id];
++    const uint32_t old_count = __atomic_load_n(&record->count, __ATOMIC_RELAXED);
++    const uint32_t sequence = smufs_rt_core_increment(&state->sequence);
++    if (!sequence || old_count == UINT32_MAX) {
++        smufs_rt_core_lost(state);
++        __atomic_store_n(&state->writer_lock[event_id], 0u, __ATOMIC_RELEASE);
++        return;
++    }
++    __atomic_store_n(&record->count, old_count + 1u, __ATOMIC_RELAXED);
++    __atomic_store_n(&record->arg, arg, __ATOMIC_RELAXED);
++    __atomic_store_n(&record->result_kind, result_kind, __ATOMIC_RELAXED);
++    __atomic_store_n(&record->result, result, __ATOMIC_RELAXED);
++    __atomic_store_n(&record->dev_valid, dev_valid != 0u ? 1u : 0u, __ATOMIC_RELAXED);
++    __atomic_store_n(&record->dev, dev_valid != 0u ? dev : 0u, __ATOMIC_RELAXED);
++    __atomic_store_n(&record->sequence, sequence, __ATOMIC_RELEASE);
++    if (!smufs_rt_core_increment(&state->writes)) smufs_rt_core_lost(state);
++    __atomic_store_n(&state->writer_lock[event_id], 0u, __ATOMIC_RELEASE);
++}
++
++static inline void smufs_rt_core_snapshot_record(const SmUfsRootTraceRecord *source,
++                                                  SmUfsRootTraceRecord *destination)
++{
++    __atomic_store_n(&destination->sequence,
++                     __atomic_load_n(&source->sequence, __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);
++    __atomic_store_n(&destination->count,
++                     __atomic_load_n(&source->count, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
++    __atomic_store_n(&destination->arg,
++                     __atomic_load_n(&source->arg, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
++    __atomic_store_n(&destination->result_kind,
++                     __atomic_load_n(&source->result_kind, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
++    __atomic_store_n(&destination->result,
++                     __atomic_load_n(&source->result, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
++    __atomic_store_n(&destination->dev_valid,
++                     __atomic_load_n(&source->dev_valid, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
++    __atomic_store_n(&destination->dev,
++                     __atomic_load_n(&source->dev, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
++}
++
++static inline uint32_t smufs_rt_core_snapshot(const SmUfsRootTraceState *state,
++                                                SmUfsRootTraceSnapshot *snapshot)
++{
++    if (state == (const SmUfsRootTraceState *)0 ||
++        snapshot == (SmUfsRootTraceSnapshot *)0) {
++        return 0u;
++    }
++
++    for (uint32_t attempt = 0u; attempt < SMUFS_RT_SNAPSHOT_RETRIES; ++attempt) {
++        const uint32_t start_sequence = __atomic_load_n(&state->sequence, __ATOMIC_ACQUIRE);
++        const uint32_t start_writes = __atomic_load_n(&state->writes, __ATOMIC_ACQUIRE);
++        const uint32_t start_lost = __atomic_load_n(&state->lost, __ATOMIC_ACQUIRE);
++        const uint32_t start_enabled = __atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE);
++        const uint32_t start_version = __atomic_load_n(&state->version, __ATOMIC_ACQUIRE);
++        uint32_t active = 0u;
++
++        for (uint32_t event_id = 0u; event_id < SMUFS_RT_EVENT_CAPACITY; ++event_id) {
++            if (__atomic_load_n(&state->writer_lock[event_id], __ATOMIC_ACQUIRE) != 0u) {
++                active = 1u;
++            }
++            smufs_rt_core_snapshot_record(&state->records[event_id],
++                                          &snapshot->records[event_id]);
++        }
++
++        snapshot->enabled = start_enabled;
++        snapshot->version = start_version;
++        snapshot->sequence = start_sequence;
++        snapshot->writes = start_writes;
++        snapshot->lost = start_lost;
++        snapshot->partial = 0u;
++
++        __atomic_thread_fence(__ATOMIC_ACQUIRE);
++        const uint32_t end_sequence = __atomic_load_n(&state->sequence, __ATOMIC_ACQUIRE);
++        const uint32_t end_writes = __atomic_load_n(&state->writes, __ATOMIC_ACQUIRE);
++        const uint32_t end_lost = __atomic_load_n(&state->lost, __ATOMIC_ACQUIRE);
++        const uint32_t end_enabled = __atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE);
++        const uint32_t end_version = __atomic_load_n(&state->version, __ATOMIC_ACQUIRE);
++        for (uint32_t event_id = 0u; event_id < SMUFS_RT_EVENT_CAPACITY; ++event_id) {
++            if (__atomic_load_n(&state->writer_lock[event_id], __ATOMIC_ACQUIRE) != 0u) {
++                active = 1u;
++            }
++        }
++        if (active == 0u && start_sequence == end_sequence &&
++            start_writes == end_writes && start_lost == end_lost &&
++            start_enabled == end_enabled && start_version == end_version) {
++            return 1u;
++        }
++    }
++
++    snapshot->partial = 1u;
++    snapshot->enabled = __atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE);
++    snapshot->version = __atomic_load_n(&state->version, __ATOMIC_ACQUIRE);
++    snapshot->sequence = __atomic_load_n(&state->sequence, __ATOMIC_ACQUIRE);
++    snapshot->writes = __atomic_load_n(&state->writes, __ATOMIC_ACQUIRE);
++    snapshot->lost = __atomic_load_n(&state->lost, __ATOMIC_ACQUIRE);
++    return 0u;
++}
++
++#ifdef __cplusplus
++} /* extern "C" */
++#endif

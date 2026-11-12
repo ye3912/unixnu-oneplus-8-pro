@@ -1,0 +1,97 @@
+--- a/iokit/IOKit/IOMemoryDescriptor.h
++++ b/iokit/IOKit/IOMemoryDescriptor.h
+@@ -761,6 +761,10 @@
+ 		mach_vm_size_t          offset = 0,
+ 		mach_vm_size_t          length = 0 );
+ 
++	// Board-owned physical CPU views do not own their backing pages.
++	void markNativeAdrenoCpuView();
++	IOReturn revokeNativeAdrenoCpuView();
++
+ #ifndef __LP64__
+ 	virtual OSPtr<IOMemoryMap>       map(
+ 		task_t          intoTask,
+--- a/iokit/Kernel/IOMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOMemoryDescriptor.cpp
+@@ -110,6 +110,12 @@
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ static IORecursiveLock * gIOMemoryLock;
++
++enum : uint16_t {
++    kNativeAdrenoCpuView = 0x2000,
++    kNativeAdrenoCpuViewRevoked = 0x4000,
++    kNativeAdrenoCpuViewUnmapFailed = 0x8000,
++};
+ 
+ #define LOCK    IORecursiveLockLock( gIOMemoryLock)
+ #define UNLOCK  IORecursiveLockUnlock( gIOMemoryLock)
+@@ -5435,6 +5441,31 @@
+ 	return err;
+ }
+ 
++void
++IOMemoryDescriptor::markNativeAdrenoCpuView()
++{
++    // A freshly constructed physical descriptor has not been published yet.
++    _internalFlags |= kNativeAdrenoCpuView;
++}
++
++IOReturn
++IOMemoryDescriptor::revokeNativeAdrenoCpuView()
++{
++    LOCK;
++    assert(_internalFlags & kNativeAdrenoCpuView);
++    _internalFlags |= kNativeAdrenoCpuViewRevoked;
++    __block IOReturn status = (_internalFlags & kNativeAdrenoCpuViewUnmapFailed)
++        ? kIOReturnVMError : kIOReturnSuccess;
++    if (_mappings && status == kIOReturnSuccess) {
++        _mappings->iterateObjects(^(OSObject *object) {
++            status = static_cast<IOMemoryMap *>(object)->unmap();
++            return status != kIOReturnSuccess;
++        });
++    }
++    UNLOCK;
++    return status;
++}
++
+ IOReturn
+ IOMemoryMap::unmap( void )
+ {
+@@ -5445,6 +5476,9 @@
+ 	if (fAddress && fAddressMap && (NULL == fSuperMap) && fMemory
+ 	    && (0 == (kIOMapStatic & fOptions))) {
+ 		err = fMemory->doUnmap(fAddressMap, (IOVirtualAddress) this, 0);
++        if (err != kIOReturnSuccess && (fMemory->_internalFlags & kNativeAdrenoCpuView)) {
++            fMemory->_internalFlags |= kNativeAdrenoCpuViewUnmapFailed;
++        }
+ 	} else {
+ 		err = kIOReturnSuccess;
+ 	}
+@@ -5888,6 +5922,15 @@
+ 
+ 	LOCK;
+ 
++    const bool adrenoView = (_internalFlags & kNativeAdrenoCpuView) != 0;
++    if (adrenoView && ((_internalFlags & kNativeAdrenoCpuViewRevoked)
++        || (options & (kIOMapStatic | kIOMapUnique | kIOMapOverwrite)))) {
++        // Those options can bypass this descriptor's mapping list or unmap.
++        UNLOCK;
++        mapping->release();
++        return NULL;
++    }
++
+ 	do{
+ 		if (kIOMapStatic & options) {
+ 			result = mapping;
+@@ -5955,6 +5998,10 @@
+ 		}
+ 	}while (false);
+ 
++    if (adrenoView && result) {
++        // A map exported to another task can receive taskDied before the BO.
++        result->userClientUnmap();
++    }
+ 	UNLOCK;
+ 
+ 	return result;

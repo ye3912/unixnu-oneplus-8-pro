@@ -1,0 +1,30 @@
+{
+  "recorded_date": "2026-11-13",
+  "image_sha256": "493568fd555fda131014d45d023346cc4e867cec10d04ef78842c688266a4965",
+  "log": "analysis/usb-cdc/unixnu-serial-20261112-234127-48576.log",
+  "log_sha256": "0eec6be0164b3b1baff5bfd102cdb4b5581281f88e2acb99bfeb5dd6a8dd1473",
+  "user_report": "撕裂没有了，卡顿明显改善",
+  "gpu_presenter_ready_observed": true,
+  "gpu_copy_completion_observed": true,
+  "persistent_data_observed": true,
+  "addon_reused_without_rewriting": true,
+  "user_reports_no_tearing_this_session": true,
+  "user_reports_performance_improved": true,
+  "physical_vblank_or_page_flip_verified": false,
+  "full_stability_accepted": false,
+  "backboardd_watchdog_restarts_observed": 1,
+  "swap_validation_rejection_lines": 745,
+  "evidence_lines": {
+    "presenter_ready": 313,
+    "persistent_data": [476, 477],
+    "addon_registration_and_reuse": [480, 481],
+    "actual_boot_args": 547,
+    "backboardd_watchdog_exit": 754,
+    "backboardd_replacement_plugin_and_fence": [758, 762],
+    "first_swap_validation_rejection": 777,
+    "gpu_completions": [1598, 1786],
+    "timing_examples": [1601, 1788]
+  },
+  "timing_limits": "SMGOP77 samples cover only eight early transfers, with client_us including more than GPU execution; Metal ctc and cumulative counters are not direct measured display FPS.",
+  "next_scope": "Preserve this image as the user-confirmed performance-improved baseline. Remaining GPU/display issues are startup watchdog, swap validation and tail latency. No Wi-Fi transition or new hardware action inferred from feedback."
+}

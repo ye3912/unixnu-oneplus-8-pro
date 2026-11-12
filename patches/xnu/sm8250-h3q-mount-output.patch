@@ -1,0 +1,134 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1016,11 +1016,18 @@
+  }
+  smufs_cache_io_unlock();
+ }
++/* Snapshot readers may be the exiting mount child. Writers remain PID1-only. */
++static uint32_t
++smufs_cache_io_read_lock(void)
++{
++ if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return 0;
++ return !__atomic_exchange_n(&smufs_cache_io.lock,1U,__ATOMIC_ACQUIRE);
++}
+ __attribute__((noinline)) static const char *
+ smufs_cache_io_note(void)
+ {
+  static char note[736];
+- if(!smufs_cache_io_lock())return "IO trace unavailable\n";
++ if(!smufs_cache_io_read_lock())return "IO trace unavailable\n";
+  uint32_t limit=smufs_cache_io.opens<32?smufs_cache_io.opens:32;int directory=-1,cache=-1,last=-1;
+  for(uint32_t i=0;i<limit;++i){
+   if(!smufs_cache_io.open[i].returned)continue;
+@@ -1046,17 +1053,79 @@
+  smufs_cache_io_unlock();return note;
+ }
+ 
++/* Bounded attempted output from the first original mount process after prep.
++ * Observation only: no file I/O, allocation, waiting, or changed syscall result.
++ */
++static struct {
++ uint32_t lock,dropped,pid,chunks,used,copy_error;int fd;
++ char scratch[256],tail[321];
++} smufs_mount_output;
++static int
++smufs_mount_current(void)
++{
++ proc_t p=current_proc();
++ return __atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE)&&p&&
++     !strncmp(p->p_name,"mount",sizeof(p->p_name));
++}
++__attribute__((noinline)) void
++native_smufs_mount_console(int fd,uint64_t address,uint64_t bytes)
++{
++ if((fd!=1&&fd!=2)||!bytes||!smufs_mount_current())return;
++ if(__atomic_exchange_n(&smufs_mount_output.lock,1U,__ATOMIC_ACQUIRE)){
++  __atomic_add_fetch(&smufs_mount_output.dropped,1U,__ATOMIC_RELAXED);return;}
++ uint32_t pid=(uint32_t)proc_getpid(current_proc());
++ if(!smufs_mount_output.pid)smufs_mount_output.pid=pid;
++ if(smufs_mount_output.pid!=pid)goto out;
++ smufs_mount_output.fd=fd;++smufs_mount_output.chunks;
++ /* At most the first512 attempted bytes per vector/chunk; tail retains320. */
++ for(uint64_t done=0;done<bytes&&done<512;){
++  uint64_t remaining=bytes-done;if(remaining>512-done)remaining=512-done;
++  size_t n=remaining<sizeof(smufs_mount_output.scratch)?(size_t)remaining:sizeof(smufs_mount_output.scratch);
++  if(address>~(uint64_t)0-done){smufs_mount_output.copy_error=EFAULT;break;}
++  int error=copyin(address+done,smufs_mount_output.scratch,n);
++  if(error){smufs_mount_output.copy_error=(uint32_t)error;break;}
++  uint32_t keep=smufs_mount_output.used;
++  if(keep+n>320){uint32_t remove=keep+(uint32_t)n-320;memmove(smufs_mount_output.tail,smufs_mount_output.tail+remove,keep-remove);keep-=remove;}
++  memcpy(smufs_mount_output.tail+keep,smufs_mount_output.scratch,n);
++  smufs_mount_output.used=keep+(uint32_t)n;smufs_mount_output.tail[smufs_mount_output.used]=0;done+=n;
++ }
++out:
++ __atomic_store_n(&smufs_mount_output.lock,0U,__ATOMIC_RELEASE);
++}
++__attribute__((noinline)) void
++native_smufs_mount_writev(int fd,uint64_t address,int32_t count)
++{
++ if((fd!=1&&fd!=2)||count<=0||!smufs_mount_current()||!proc_is64bit_data(current_proc()))return;
++ /* arm64 user_iovec64 is two uint64_t fields. Never follow more than8 entries. */
++ for(int32_t i=0;i<count&&i<8;++i){
++  struct {uint64_t base,length;} v;
++  if(address>~(uint64_t)0-(uint64_t)i*sizeof(v))return;
++  if(copyin(address+(uint64_t)i*sizeof(v),&v,sizeof(v)))return;
++  native_smufs_mount_console(fd,v.base,v.length);
++ }
++}
++__attribute__((noinline)) static const char *
++smufs_mount_output_note(void)
++{
++ static char note[416];
++ if(__atomic_exchange_n(&smufs_mount_output.lock,1U,__ATOMIC_ACQUIRE))return "mount output busy\n";
++ snprintf(note,sizeof(note),"mount-output pid%u current%u chunks%u fd%d copy%u drop%u\n%.320s\n",
++     smufs_mount_output.pid,(uint32_t)proc_getpid(current_proc()),smufs_mount_output.chunks,smufs_mount_output.fd,
++     smufs_mount_output.copy_error,__atomic_load_n(&smufs_mount_output.dropped,__ATOMIC_RELAXED),smufs_mount_output.tail);
++ __atomic_store_n(&smufs_mount_output.lock,0U,__ATOMIC_RELEASE);return note;
++}
++
+ __attribute__((noinline)) const char *
+ native_smufs_cache_panic_note(void)
+ {
+- static char note[944];
++ static char note[1488];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3o prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3q prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),smufs_cache_io_note());
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),smufs_cache_io_note(),smufs_mount_output_note());
+  return note;
+ }
+ 
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -35,6 +35,8 @@
+ void native_smufs_cache_io_result(uint32_t op,int fd,int error,int64_t value,uint64_t wanted,uint64_t offset);
+ void native_smufs_cache_signature(uint32_t returning,int fd,int error,uint64_t user_arg);
+ void native_smufs_cache_console(int fd,uint64_t address,uint64_t bytes);
++void native_smufs_mount_console(int fd,uint64_t address,uint64_t bytes);
++void native_smufs_mount_writev(int fd,uint64_t address,int32_t count);
+ struct vnode;
+ int native_smufs_cache_carrier(struct vnode *process_root,struct vnode *file);
+ void native_smufs_cache_map_event(uint32_t returning,int error);
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -703,6 +703,7 @@
+ write_nocancel(struct proc *p, struct write_nocancel_args *uap, user_ssize_t *retval)
+ {
+ 	native_smufs_cache_console(uap->fd,uap->cbuf,uap->nbyte);
++	native_smufs_mount_console(uap->fd,uap->cbuf,uap->nbyte);
+ 	return write_internal(p, uap->fd, uap->cbuf, uap->nbyte, (off_t)-1, 0,
+ 	           NULL, retval);
+ }
+@@ -800,6 +801,7 @@
+ int
+ writev_nocancel(struct proc *p, struct writev_nocancel_args *uap, user_ssize_t *retval)
+ {
++	native_smufs_mount_writev(uap->fd,uap->iovp,uap->iovcnt);
+ 	return writev_uio(p, uap->fd, uap->iovp, uap->iovcnt, 0, 0, NULL, retval);
+ }
+ 

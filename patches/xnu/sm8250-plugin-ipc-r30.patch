@@ -1,0 +1,304 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -114,6 +114,267 @@
+ #include <sys/kdebug.h>
+ #include <sys/proc_ro.h>
+ 
++/* Board diagnostic for the original 21H461 PlugInKit synchronous match.
++ * Runs only at user Mach send/receive boundaries, outside IPC locks.
++ */
++#if (DEVELOPMENT || DEBUG) && defined(__arm64__)
++#include <pexpert/pexpert.h>
++#include <string.h>
++
++struct proc;
++extern void proc_selfname(char *, int);
++extern void proc_getexecutableuuid(struct proc *, unsigned char *, unsigned long);
++extern int native_sm_gui_cache_identity(task_t, unsigned char *, uint32_t *);
++extern int native_sm_gui_fault_state(uint64_t *, unsigned);
++
++enum { PK30_MAX = 8, PK30_FRAMES = 24 };
++enum pk30_phase { PK30_REQUEST = 1, PK30_RECV, PK30_REPLY, PK30_DONE };
++struct pk30_slot {
++	ipc_kmsg_t message;
++	ipc_port_t reply;
++	mach_msg_id_t msgid;
++	enum pk30_phase phase;
++};
++struct pk30_event {
++	unsigned slot;
++	enum pk30_phase phase;
++};
++static struct pk30_slot pk30_slots[PK30_MAX];
++static unsigned pk30_used, pk30_lock, pk30_contention, pk30_saturated, pk30_qual_fail;
++static unsigned pk30_enabled;
++
++static bool
++pk30_on(void)
++{
++	unsigned enabled = __atomic_load_n(&pk30_enabled, __ATOMIC_RELAXED);
++	if (!enabled) {
++		unsigned arg = 0;
++		PE_parse_boot_argn("plugin-ipc-diag", &arg, sizeof(arg));
++		enabled = arg == 1 ? 2 : 1;
++		__atomic_store_n(&pk30_enabled, enabled, __ATOMIC_RELAXED);
++	}
++	return enabled == 2;
++}
++
++static bool
++pk30_enter(void)
++{
++	unsigned expected = 0;
++	if (__atomic_compare_exchange_n(&pk30_lock, &expected, 1, false,
++	    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++		return true;
++	}
++	__atomic_add_fetch(&pk30_contention, 1, __ATOMIC_RELAXED);
++	return false;
++}
++
++static void
++pk30_leave(void)
++{
++	__atomic_store_n(&pk30_lock, 0, __ATOMIC_RELEASE);
++}
++
++static bool
++pk30_match(void)
++{
++	static const unsigned char chronod[16] = {
++		0x1a,0xb6,0xa2,0x83,0x69,0x5a,0x3e,0x4a,0xa3,0xd4,0x2e,0x7a,0xa2,0xf2,0xdd,0x42
++	};
++	static const unsigned char cache[16] = {
++		0x59,0x0d,0x83,0x9a,0x82,0xd2,0x30,0xf1,0xa1,0x7d,0x0c,0xc0,0x53,0x42,0x0f,0x73
++	};
++	char name[16] = {};
++	unsigned char uuid[16];
++	uint64_t state[15];
++	uint32_t slide;
++	struct proc *proc;
++
++	if (!(current_thread()->thread_tag & THREAD_TAG_MAINTHREAD)) {
++		return false;
++	}
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "chronod")) {
++		return false;
++	}
++	proc = get_bsdtask_info(current_task());
++	if (!proc) {
++		goto unavailable;
++	}
++	proc_getexecutableuuid(proc, uuid, sizeof(uuid));
++	if (memcmp(uuid, chronod, sizeof(uuid)) ||
++	    !native_sm_gui_cache_identity(current_task(), uuid, &slide) ||
++	    memcmp(uuid, cache, sizeof(uuid)) ||
++	    !native_sm_gui_fault_state(state, 15)) {
++		goto unavailable;
++	}
++	const uint64_t expected = 0x1b14199ccULL + slide;
++	uint64_t frame = state[2], floor = state[3];
++	for (unsigned i = 0; i < PK30_FRAMES; i++) {
++		uint64_t pair[2];
++		if ((frame & 15) || frame < floor || frame - floor > (1ULL << 20) ||
++		    frame > UINT64_MAX - sizeof(pair) || copyin(frame, pair, sizeof(pair))) {
++			break;
++		}
++		if (pair[1] == expected) {
++			return true;
++		}
++		if (pair[0] <= frame) {
++			break;
++		}
++		frame = pair[0];
++	}
++unavailable:
++	unsigned misses = __atomic_add_fetch(&pk30_qual_fail, 1, __ATOMIC_RELAXED);
++	if (misses <= 2 || misses == 32) {
++		printf("PKIPC30 qualifier miss%u pid%d\n", misses, task_pid(current_task()));
++	}
++	return false;
++}
++
++static int
++pk30_owner(ipc_port_t port)
++{
++	int pid = -1;
++	ip_mq_lock(port);
++	if (ip_active(port) && !port->ip_tempowner && ip_in_a_space(port)) {
++		if (ip_in_space(port, ipc_space_kernel)) {
++			pid = 0;
++		} else {
++			ipc_space_t space = ip_get_receiver(port);
++			if (space && is_active(space) && space->is_task) {
++				pid = task_pid(space->is_task);
++			}
++		}
++	}
++	ip_mq_unlock(port);
++	return pid;
++}
++
++static struct pk30_event
++pk30_send(ipc_kmsg_t kmsg)
++{
++	struct pk30_event event = {};
++	if (!pk30_on()) {
++		return event;
++	}
++	mach_msg_header_t *hdr = ikm_header(kmsg);
++	ipc_port_t dest = hdr->msgh_remote_port;
++	ipc_port_t reply = hdr->msgh_local_port;
++	const mach_msg_id_t msgid = hdr->msgh_id;
++	const mach_msg_bits_t bits = hdr->msgh_bits;
++
++	if (MACH_MSGH_BITS_LOCAL(bits) == MACH_MSG_TYPE_PORT_SEND_ONCE &&
++	    IP_VALID(reply) && IP_VALID(dest) && pk30_match()) {
++		ip_reference(reply);
++		if (pk30_enter()) {
++			unsigned index = __atomic_load_n(&pk30_used, __ATOMIC_RELAXED);
++			if (index < PK30_MAX) {
++				pk30_slots[index] = (struct pk30_slot){ kmsg, reply, msgid, PK30_REQUEST };
++				__atomic_store_n(&pk30_used, index + 1, __ATOMIC_RELAXED);
++				event = (struct pk30_event){ index + 1, PK30_REQUEST };
++			} else {
++				__atomic_add_fetch(&pk30_saturated, 1, __ATOMIC_RELAXED);
++			}
++			pk30_leave();
++		}
++		if (!event.slot) {
++			ip_release(reply);
++		}
++	} else if (MACH_MSGH_BITS_REMOTE(bits) == MACH_MSG_TYPE_PORT_SEND_ONCE &&
++	    __atomic_load_n(&pk30_used, __ATOMIC_RELAXED) && pk30_enter()) {
++		unsigned found = PK30_MAX, matches = 0;
++		for (unsigned i = 0; i < __atomic_load_n(&pk30_used, __ATOMIC_RELAXED); i++) {
++			if (pk30_slots[i].reply == dest && pk30_slots[i].phase == PK30_RECV) {
++				found = i;
++				matches++;
++			}
++		}
++		if (matches == 1) {
++			pk30_slots[found].message = kmsg;
++			pk30_slots[found].msgid = msgid;
++			pk30_slots[found].phase = PK30_REPLY;
++			event = (struct pk30_event){ found + 1, PK30_REPLY };
++		}
++		pk30_leave();
++	}
++	if (event.slot) {
++		printf("PKIPC30 send slot%u phase%u pid%d owner%d msgid%x tid%llu\n",
++		    event.slot, event.phase, task_pid(current_task()), pk30_owner(dest),
++		    (unsigned)msgid, current_thread()->thread_id);
++	}
++	return event;
++}
++
++static struct pk30_event
++pk30_take(ipc_kmsg_t kmsg)
++{
++	struct pk30_event event = {};
++	if (!__atomic_load_n(&pk30_used, __ATOMIC_RELAXED) || !pk30_enter()) {
++		return event;
++	}
++	mach_msg_header_t *hdr = ikm_header(kmsg);
++	for (unsigned i = 0; i < __atomic_load_n(&pk30_used, __ATOMIC_RELAXED); i++) {
++		struct pk30_slot *slot = &pk30_slots[i];
++		if (slot->message != kmsg || slot->msgid != hdr->msgh_id) {
++			continue;
++		}
++		if ((slot->phase == PK30_REQUEST && slot->reply == hdr->msgh_local_port) ||
++		    (slot->phase == PK30_REPLY && slot->reply == hdr->msgh_remote_port)) {
++			event = (struct pk30_event){ i + 1, slot->phase };
++			slot->message = IKM_NULL;
++			break;
++		}
++	}
++	pk30_leave();
++	return event;
++}
++
++static void
++pk30_finish(struct pk30_event event, bool received, mach_msg_return_t status)
++{
++	if (!event.slot) {
++		return;
++	}
++	ipc_port_t release = IP_NULL;
++	if ((received || status != MACH_MSG_SUCCESS) && pk30_enter()) {
++		struct pk30_slot *slot = &pk30_slots[event.slot - 1];
++		if (slot->phase == event.phase) {
++			if (received && status == MACH_MSG_SUCCESS && event.phase == PK30_REQUEST) {
++				slot->phase = PK30_RECV;
++			} else {
++				slot->phase = PK30_DONE;
++				slot->message = IKM_NULL;
++				release = slot->reply;
++				slot->reply = IP_NULL;
++			}
++		}
++		pk30_leave();
++	}
++	if (IP_VALID(release)) {
++		ip_release(release);
++	}
++	if (received && event.phase == PK30_REQUEST && status == MACH_MSG_SUCCESS) {
++		static const unsigned char pkd[16] = {
++			0x43,0x21,0x8c,0x16,0x2f,0xa7,0x33,0x9d,0xad,0x93,0x94,0x65,0x46,0x83,0xe3,0xb3
++		};
++		struct proc *proc = get_bsdtask_info(current_task());
++		unsigned char uuid[16] = {};
++		if (proc) {
++			proc_getexecutableuuid(proc, uuid, sizeof(uuid));
++		}
++		printf("PKIPC30 peer slot%u pid%d pkd-uuid-match%u\n",
++		    event.slot, task_pid(current_task()), (unsigned)(memcmp(uuid, pkd, sizeof(uuid)) == 0));
++	}
++	printf("PKIPC30 %s slot%u phase%u pid%d tid%llu status%x contention%u qualfail%u saturated%u\n",
++	    received ? "receive" : "result", event.slot, event.phase,
++	    task_pid(current_task()), current_thread()->thread_id, (unsigned)status,
++	    __atomic_load_n(&pk30_contention, __ATOMIC_RELAXED),
++	    __atomic_load_n(&pk30_qual_fail, __ATOMIC_RELAXED),
++	    __atomic_load_n(&pk30_saturated, __ATOMIC_RELAXED));
++}
++#endif
++
++
+ #ifndef offsetof
+ #define offsetof(type, member)  ((size_t)(&((type *)0)->member))
+ #endif /* offsetof */
+@@ -355,6 +616,9 @@
+ 	 * ipc_kmsg_copyout_guarded_port_descriptor()
+ 	 */
+ 	self->ith_recv_bufs = recv_bufs;
++#if (DEVELOPMENT || DEBUG) && defined(__arm64__)
++	struct pk30_event pk30_received = pk30_take(kmsg);
++#endif
+ 	mr = ipc_kmsg_copyout(kmsg, space, map, options);
+ 
+ 	if (mr != MACH_MSG_SUCCESS) {
+@@ -376,6 +640,9 @@
+ 		    options, map, mr);
+ 	}
+ 	/* kmsg freed */
++#if (DEVELOPMENT || DEBUG) && defined(__arm64__)
++	pk30_finish(pk30_received, true, mr);
++#endif
+ 
+ out:
+ 	if (msgr_out) {
+@@ -728,7 +995,13 @@
+ 		return mr;
+ 	}
+ 
++#if (DEVELOPMENT || DEBUG) && defined(__arm64__)
++	struct pk30_event pk30_sent = pk30_send(kmsg);
++#endif
+ 	mr = ipc_kmsg_send(kmsg, options, msg_timeout);
++#if (DEVELOPMENT || DEBUG) && defined(__arm64__)
++	pk30_finish(pk30_sent, false, mr);
++#endif
+ 
+ 	if (mr != MACH_MSG_SUCCESS) {
+ 		mr |= mach_msg_receive_pseudo(kmsg, send_uctx, options, space, map);

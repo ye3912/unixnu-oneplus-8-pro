@@ -1,0 +1,74 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -592,6 +592,59 @@
+     return smufs_rt_core_snapshot(&smufs_root_trace_state, out);
+ }
+ 
++/* H3 diagnostic: entered only from the existing authentication refusal branch.
++ * Snapshot storage is static to avoid placing a 2 KiB record on the boot stack.
++ * No authentication operation is retried and no acceptance decision is changed. */
++__attribute__((noinline, noreturn)) static void
++native_smufs_auth_diag(int autherr, int owner_authorized, int require_rootauth)
++{
++	static SmUfsRootTraceSnapshot snapshot;
++	uint32_t coherent = native_smufs_root_trace_snapshot(&snapshot);
++	const SmUfsRootTraceRecord *r = snapshot.records;
++	mount_t mounted = rootvnode ? vnode_mount(rootvnode) : NULL;
++	vnode_t device_vnode = mounted ? vfs_devvp(mounted) : NULLVP;
++	dev_t mounted_dev = device_vnode ? vnode_specrdev(device_vnode) : NODEV;
++	uint64_t mount_flags = mounted ? vfs_flags(mounted) : 0;
++	struct vfsstatfs *stat = mounted ? vfs_statfs(mounted) : NULL;
++	const char *fsname = stat ? stat->f_fstypename : "none";
++	if (device_vnode) vnode_put(device_vnode);
++	int audit_enabled = 0, trust_enabled = 0, owner_decision = -1, owner_readonly = -1;
++	dev_t owner_mount = NODEV, owner_selected = NODEV;
++#if defined(XNU_OWNER_ROOT_AUDIT) && XNU_OWNER_ROOT_AUDIT
++	{
++		extern volatile int native_owner_root_decision, native_owner_root_readonly;
++		extern volatile dev_t native_owner_root_mount_device, native_owner_root_selected_device;
++		audit_enabled = 1;
++		owner_decision = native_owner_root_decision;
++		owner_readonly = native_owner_root_readonly;
++		owner_mount = native_owner_root_mount_device;
++		owner_selected = native_owner_root_selected_device;
++	}
++#endif
++#if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST
++	trust_enabled = 1;
++#endif
++	panic("SMUFS root-h3-auth autherr=%d owner_auth=%d require=%d\n"
++	      "root %s selected%x mounted%x mount-valid%d vnode%d ro%d flags%llx fs=%s\n"
++	      "owner audit%d trust%d decision%d ro%d selected%x mounted%x\n"
++	      "trace en%u coherent%u partial%u lost%u writes%u\n"
++	      "mount%u/%u errno%d secure%u/%u\n"
++	      "vfsroot%u/%u errno%d published%u valid%u dev%x\n"
++	      "auth%u/%u errno%d devfs%u/%u errno%d\n",
++	      autherr, owner_authorized, require_rootauth,
++	      rootdevice, (uint32_t)rootdev, (uint32_t)mounted_dev, mounted != NULL, rootvnode != NULLVP,
++	      (mount_flags & MNT_RDONLY) != 0, (unsigned long long)mount_flags, fsname,
++	      audit_enabled, trust_enabled, owner_decision, owner_readonly, (uint32_t)owner_selected, (uint32_t)owner_mount,
++	      snapshot.enabled, coherent, snapshot.partial, snapshot.lost, snapshot.writes,
++	      r[SMRT_MOUNT_ENTER].count, r[SMRT_MOUNT_RETURN].count, r[SMRT_MOUNT_RETURN].result,
++	      r[SMRT_SECURE_ENTER].count, r[SMRT_SECURE_RETURN].count,
++	      r[SMRT_VFSROOT_ENTER].count, r[SMRT_VFSROOT_RETURN].count, r[SMRT_VFSROOT_RETURN].result,
++	      r[SMRT_ROOT_PUBLISHED].count, r[SMRT_ROOT_PUBLISHED].dev_valid, r[SMRT_ROOT_PUBLISHED].dev,
++	      r[SMRT_AUTH_ENTER].count, r[SMRT_AUTH_RETURN].count, r[SMRT_AUTH_RETURN].result,
++	      r[SMRT_DEVFS_ENTER].count, r[SMRT_DEVFS_RETURN].count, r[SMRT_DEVFS_RETURN].result);
++}
++
++
+ void
+ bsd_init(void)
+ {
+@@ -1157,6 +1210,11 @@
+ 			}
+ #endif
+ 			if (autherr && !owner_authorized) {
++				uint32_t smufs_auth_diagnostics = 0;
++				if (PE_parse_boot_argn("native-ufs-auth-diag", &smufs_auth_diagnostics,
++				    sizeof(smufs_auth_diagnostics)) && smufs_auth_diagnostics) {
++					native_smufs_auth_diag(autherr, owner_authorized, require_rootauth);
++				}
+ 				panic("rootvp not authenticated after mounting");
+ 			}
+ #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST

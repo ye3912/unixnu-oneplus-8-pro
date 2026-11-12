@@ -1,0 +1,84 @@
+--- a/iokit/IOKit/IOMemoryDescriptor.h
++++ b/iokit/IOKit/IOMemoryDescriptor.h
+@@ -761,8 +761,8 @@
+ 		mach_vm_size_t          offset = 0,
+ 		mach_vm_size_t          length = 0 );
+ 
+-	// Board-owned physical CPU views do not own their backing pages.
+-	void markNativeAdrenoCpuView();
++	// Keep the backing alive until the physical view's last VM reference goes away.
++	void markNativeAdrenoCpuView(IOMemoryDescriptor *backing);
+ 	IOReturn revokeNativeAdrenoCpuView();
+ 
+ #ifndef __LP64__
+--- a/iokit/Kernel/IOKitKernelInternal.h
++++ b/iokit/Kernel/IOKitKernelInternal.h
+@@ -162,6 +162,7 @@
+ 
+ struct IOMemoryDescriptorReserved {
+ 	IOMemoryDescriptorDevicePager dp;
++	IOMemoryDescriptor * nativeAdrenoBacking;
+ 	uint64_t                      descriptorID;
+ 	uint64_t                      preparationID;
+ 	// for kernel IOMD subclasses... they have no expansion
+--- a/iokit/Kernel/IOMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOMemoryDescriptor.cpp
+@@ -220,6 +220,14 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++static void
++freeMemoryDescriptorReserved(IOMemoryDescriptorReserved *ref)
++{
++    IOMemoryDescriptor *backing = ref->nativeAdrenoBacking;
++    IOFreeType(ref, IOMemoryDescriptorReserved);
++    if (backing) backing->release();
++}
++
+ extern "C" {
+ kern_return_t
+ device_data_action(
+@@ -252,7 +260,7 @@
+ {
+ 	IOMemoryDescriptorReserved * ref = (IOMemoryDescriptorReserved *) device_handle;
+ 
+-	IOFreeType( ref, IOMemoryDescriptorReserved );
++	freeMemoryDescriptorReserved(ref);
+ 
+ 	return kIOReturnSuccess;
+ }
+@@ -2411,7 +2419,7 @@
+ 			// (IOMemoryDescriptorReserved) so no reserved access after this point
+ 			device_pager_deallocate((memory_object_t) reserved->dp.devicePager );
+ 		} else {
+-			IOFreeType(reserved, IOMemoryDescriptorReserved);
++			freeMemoryDescriptorReserved(reserved);
+ 		}
+ 		reserved = NULL;
+ 	}
+@@ -5442,9 +5450,13 @@
+ }
+ 
+ void
+-IOMemoryDescriptor::markNativeAdrenoCpuView()
+-{
+-    // A freshly constructed physical descriptor has not been published yet.
++IOMemoryDescriptor::markNativeAdrenoCpuView(IOMemoryDescriptor *backing)
++{
++    // The new physical descriptor is private until clientMemoryForType publishes it.
++    auto *state = getKernelReserved();
++    assert(backing && state && !state->nativeAdrenoBacking);
++    backing->retain();
++    state->nativeAdrenoBacking = backing;
+     _internalFlags |= kNativeAdrenoCpuView;
+ }
+ 
+@@ -5737,7 +5749,7 @@
+ 
+ 	if (reserved) {
+ 		cleanKernelReserved(reserved);
+-		IOFreeType(reserved, IOMemoryDescriptorReserved);
++		freeMemoryDescriptorReserved(reserved);
+ 		reserved = NULL;
+ 	}
+ 	super::free();

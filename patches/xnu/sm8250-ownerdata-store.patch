@@ -1,0 +1,53 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1322,6 +1322,13 @@
+ }
+ 
+ static int
++smufs_data_backend_ready(void)
++{
++ uint32_t state=__atomic_load_n(&native_data_persist_state,__ATOMIC_ACQUIRE);
++ return state==0 || state==2 || state==3;
++}
++
++static int
+ smufs_data_seed_matches(uint32_t device,uint64_t bytes,const uint8_t hash[32],
+     uint32_t os_device,uint32_t system_device)
+ {
+@@ -1361,12 +1368,12 @@
+  if(proc_getpid(current_proc())!=1 || !scratch || scratch>~(uint64_t)0-0x600 ||
+     rootvnode!=cache->original_root || !smufs_cache_root_valid() || !cache->readonly ||
+     !cache->system_mount || !(vfs_flags(cache->system_mount)&MNT_RDONLY) ||
+-    !smufs_cache_integrity_valid(cache,1) || native_data_persist_state)goto done;
++    !smufs_cache_integrity_valid(cache,1) || !smufs_data_backend_ready())goto done;
+  if(!native_ram_block_volume_seed(smufs_data_uuid,&selected,smufs_data_state.device,
+       sizeof(smufs_data_state.device),&base,&bytes,d->hash)){error=ENOENT;goto done;}
+  smufs_data_state.selected=(uint32_t)selected;smufs_data_state.bytes=bytes;
+  if(!smufs_data_seed_matches((uint32_t)selected,bytes,d->hash,(uint32_t)rootdev,cache->selected) ||
+-    strncmp(smufs_data_state.device,"/dev/disk",9) || native_data_persist_state){error=EAUTH;goto done;}
++    strncmp(smufs_data_state.device,"/dev/disk",9) || !smufs_data_backend_ready()){error=EAUTH;goto done;}
+  smufs_data_state.seed_ok=1;smufs_data_state.stage=2;
+  error=vnode_lookup("/private/var",0,&data_root,vfs_context_current());
+  if(error)goto done;
+@@ -1406,7 +1413,7 @@
+     sizeof(d->postpath),&postbase,&postbytes,d->posthash) && fresh==selected && postbytes==bytes &&
+     !strcmp(d->postpath,smufs_data_state.device) &&
+     smufs_data_seed_matches((uint32_t)fresh,postbytes,d->posthash,(uint32_t)rootdev,cache->selected);
+- if(!smufs_data_state.rebound || native_data_persist_state){error=EAUTH;goto done;}
++ if(!smufs_data_state.rebound || !smufs_data_backend_ready()){error=EAUTH;goto done;}
+  error=vnode_lookup("/var/db/timezone",0,&timezone,vfs_context_current());
+  if(error)goto done;
+  smufs_data_state.path_bound=vnode_vtype(timezone)==VDIR && vnode_mount(timezone)==data_mount;
+@@ -1418,8 +1425,10 @@
+  if(d)kfree_data(d,sizeof(*d));
+  smufs_data_state.error=error;
+  if(!error && smufs_data_state.stage==5) {
+-  __atomic_store_n(&smufs_aks_fresh_data,1,__ATOMIC_RELEASE);
+-  printf("KEYSTATE36 verified factory RAM Data, state queries eligible\n");
++  if(native_data_persist_state==0) {
++   __atomic_store_n(&smufs_aks_fresh_data,1,__ATOMIC_RELEASE);
++   printf("KEYSTATE36 verified factory RAM Data, state queries eligible\n");
++  }
+   printf("SMUFS data-h3t prepared %s",smufs_data_note());
+  }
+  return error;

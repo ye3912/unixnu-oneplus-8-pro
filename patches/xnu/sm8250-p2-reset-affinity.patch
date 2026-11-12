@@ -1,0 +1,53 @@
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -145,11 +145,8 @@
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+-#if HAS_CLUSTER
+-	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
+-#else
+-	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+-#endif
++	// IN2020 CPU_PHYS_ID includes Aff1. Aff0 alone aliases CPU1 to CPU0.
++	and		x0, x15, #0xFFFF
+ 	ldr		x1, [x19, CPU_DATA_ENTRIES]			// Load start of data entries
+ 	add		x3, x1, MAX_CPUS * 16				// end addr of data entries = start + (16 * MAX_CPUS)
+ Lcheck_cpu_data_entry:
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -965,7 +965,19 @@
+ 		}
+ #endif
+ #endif /* CONFIG_SPTM */
+-		(void) PE_cpu_start(cpu_data_ptr->cpu_id, (vm_offset_t)NULL, (vm_offset_t)NULL);
++		if (cpu == 1) {
++			kprintf("ARMCPU-P2R reset-request cpu=%d affinity=%x handler=%llx\n",
++			    cpu, cpu_data_ptr->cpu_phys_id,
++			    (unsigned long long)cpu_data_ptr->cpu_reset_handler);
++		}
++		kern_return_t start_result = PE_cpu_start(cpu_data_ptr->cpu_id, (vm_offset_t)NULL, (vm_offset_t)NULL);
++		if (cpu == 1) {
++			extern volatile uint32_t armcpu_smp_step[8];
++			extern volatile int32_t armcpu_smp_psci_rc[8];
++			kprintf("ARMCPU-P2R reset-return cpu=%d platform=%d step=%u psci_raw=%d\n",
++			    cpu, start_result, __atomic_load_n(&armcpu_smp_step[1], __ATOMIC_RELAXED),
++			    __atomic_load_n(&armcpu_smp_psci_rc[1], __ATOMIC_RELAXED));
++		}
+ 	}
+ 
+ 	return KERN_SUCCESS;
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -737,6 +737,11 @@
+ 	 * drivers use mach_absolute_time() to implement rate control
+ 	 */
+ 	cpu_timebase_init(FALSE);
++	if (cpu_data_ptr->cpu_number == 1) {
++		uint64_t mpidr;
++		__asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
++		kprintf("ARMCPU-P2R entry cpu=1 mpidr=%llx\n", (unsigned long long)mpidr);
++	}
+ 
+ #if KPERF
+ 	/* kptimer_curcpu_up() must be called after cpu_timebase_init */

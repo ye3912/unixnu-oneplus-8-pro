@@ -1,0 +1,79 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -930,6 +930,7 @@
+  if(error){int zero=0;(void)__atomic_compare_exchange_n(&smufs_cache_carrier.first_map_error,&zero,error,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED);}
+  __atomic_add_fetch(&smufs_cache_carrier.map_return,1U,__ATOMIC_RELEASE);
+ }
++static uint32_t smufs_cache_stdio_ready;
+ /* H3N observes only PID1 after verified preparation. No I/O result is changed. */
+ static struct {
+  uint32_t lock,dropped,opens,closed;
+@@ -1050,7 +1051,8 @@
+ {
+  static char note[944];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3n prep1 carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3o prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s",
++     __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+@@ -1148,6 +1150,9 @@
+   v->root_same=rootvnode==v->original_root;v->root_after=smufs_cache_root_valid();
+   if(!v->root_same||!v->root_after||!smufs_cache_integrity_valid(v,1)){v->error=EAUTH;smufs_cache_probe_report("continue-policy",v);}
+   if(!smufs_cache_carrier_publish(v)){v->error=EAUTH;smufs_cache_probe_report("carrier-publication",v);}
++  v->error=native_smufs_cache_prepare_stdio();
++  if(v->error)smufs_cache_probe_report("init-stdio",v);
++  __atomic_store_n(&smufs_cache_stdio_ready,7U,__ATOMIC_RELEASE);
+   printf("SMUFS cache-h3m prepared flags%u self%u checked%llu bad%llu files%u env1 root%u; continuing original init\n",
+       v->system_flags,v->system_selftests,(unsigned long long)v->system_checked,(unsigned long long)v->system_bad,v->files,v->root_after);
+   uint64_t envp=scratch+0x500;kfree_data(v,sizeof(*v));return envp;
+--- a/bsd/sys/smufs_init_trace.h
++++ b/bsd/sys/smufs_init_trace.h
+@@ -29,6 +29,7 @@
+ void native_smufs_init_mprotect_return(int32_t error);
+ void native_smufs_init_user_svc(uint64_t pc,uint64_t sp,uint64_t lr,int32_t trap,uint32_t cpsr,uint32_t esr);
+ int native_smufs_cache_io_enabled(void);
++int native_smufs_cache_prepare_stdio(void);
+ uint32_t native_smufs_cache_open_begin(int dirfd,uint64_t path);
+ void native_smufs_cache_open_end(uint32_t ticket,int error,int fd);
+ void native_smufs_cache_io_result(uint32_t op,int fd,int error,int64_t value,uint64_t wanted,uint64_t offset);
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -5122,6 +5122,36 @@
+ 	return error;
+ }
+ 
++/* H3O: keep the cache directory away from libignition-owned fd 0/1/2.
++ * Only the verified mode3 PID1 preparation calls this before the original exec.
++ * Refuse any existing standard descriptor; never overwrite unknown ownership.
++ */
++__attribute__((noinline)) int
++native_smufs_cache_prepare_stdio(void)
++{
++ if(!native_smufs_cache_io_enabled())return EPERM;
++ proc_t p=current_proc();vfs_context_t ctx=vfs_context_current();
++ for(int i=0;i<3;++i){
++  struct fileproc *fp=NULL;int error=fp_lookup(p,i,&fp,0);
++  if(!error){(void)fp_drop(p,i,fp,0);return EBUSY;}
++  if(error!=EBADF)return error;
++ }
++ int opened[3]={-1,-1,-1};int error=0;
++ for(int i=0;i<3;++i){
++  int32_t fd=-1;
++  error=openat_internal(ctx,(user_addr_t)"/dev/null",(i?O_WRONLY:O_RDONLY)|O_NOCTTY,
++      0,AT_FDCWD,UIO_SYSSPACE,&fd);
++  if(error)goto fail;
++  opened[i]=fd;
++  if(fd!=i){error=EBUSY;goto fail;}
++ }
++ return 0;
++fail:
++ /* Any failure stops init. Roll back only descriptors created by this call. */
++ for(int i=2;i>=0;--i)if(opened[i]>=0)(void)close_nocancel(p,vfs_context_ucred(ctx),opened[i]);
++ return error;
++}
++
+ int
+ open(proc_t p, struct open_args *uap, int32_t *retval)
+ {

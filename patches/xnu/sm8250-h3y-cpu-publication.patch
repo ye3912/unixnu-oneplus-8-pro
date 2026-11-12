@@ -1,0 +1,86 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1641,6 +1641,45 @@
+ 	return nub;
+ }
+ 
++/* Board publication policy for the selected ArmCpu9066b53 implementation.
++ * GF0168 keeps unselected CPUs in the DT but withholds their IOService nub.
++ * ArmCpu also rejects nonboot CPUs when sheng-smp=0 and logical slots>=8.
++ * Mirror that selection before registration; never clear a busy reference.
++ */
++static unsigned smufs_cpu_eligible, smufs_cpu_withheld, smufs_cpu_invalid;
++static unsigned smufs_cpu_smp;
++static int smufs_cpu_boot = -1;
++extern "C" __attribute__((noinline)) bool
++native_smufs_cpu_nub_selected(int logical)
++{
++    unsigned smp = 0;
++    PE_parse_boot_argn("sheng-smp", &smp, sizeof(smp));
++    int boot = ml_get_boot_cpu_number();
++    __atomic_store_n(&smufs_cpu_smp, smp, __ATOMIC_RELAXED);
++    __atomic_store_n(&smufs_cpu_boot, boot, __ATOMIC_RELAXED);
++    bool selected = logical >= 0 &&
++        (logical == boot || (smp != 0 && logical < 8));
++    if (selected) __atomic_add_fetch(&smufs_cpu_eligible, 1U, __ATOMIC_RELAXED);
++    else {
++        __atomic_add_fetch(&smufs_cpu_withheld, 1U, __ATOMIC_RELAXED);
++        if (logical < 0) __atomic_add_fetch(&smufs_cpu_invalid, 1U, __ATOMIC_RELAXED);
++    }
++    return selected;
++}
++extern "C" const char *native_smufs_cpu_policy_note(void)
++{
++    static char note[192];
++    // Selection observations, not claims of live secondary CPU execution.
++    snprintf(note, sizeof(note), "cpu-policy eligible%u withheld%u invalid%u boot%d smp%u slots8\n",
++        __atomic_load_n(&smufs_cpu_eligible, __ATOMIC_RELAXED),
++        __atomic_load_n(&smufs_cpu_withheld, __ATOMIC_RELAXED),
++        __atomic_load_n(&smufs_cpu_invalid, __ATOMIC_RELAXED),
++        __atomic_load_n(&smufs_cpu_boot, __ATOMIC_RELAXED),
++        __atomic_load_n(&smufs_cpu_smp, __ATOMIC_RELAXED));
++    return note;
++}
++
++
+ bool
+ IODTPlatformExpert::createNubs( IOService * parent, OSIterator * iter )
+ {
+@@ -1686,8 +1725,10 @@
+ 			 * Note that this condition will not trigger for harvested cores because these do not show up
+ 			 * in the DT/IORegistry in the first place.
+ 			 */
+-			if (logical_cpu_id < 0) {
+-				nub->registerService();
++			if (!native_smufs_cpu_nub_selected(logical_cpu_id)) {
++				// Preserve the real DT node. This CPU is not supported by the
++				// current ArmCpu selection; do not expose it to donor drivers.
++				nub->detach(parent);
+ 				continue;
+ 			}
+ 
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1244,6 +1244,7 @@
+  return note;
+ }
+ 
++extern const char *native_smufs_cpu_policy_note(void);
+ extern int native_smufs_boot_status_prepare(void);
+ extern const char *native_smufs_boot_status_note(void);
+ extern int native_smufs_watchdog_prepare(void);
+@@ -1255,12 +1256,12 @@
+ {
+  static char note[4096];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3x prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s%s%s%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3y prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s%s%s%s%s%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_smufs_watchdog_note(),native_smufs_boot_status_note(),smufs_watchdog_brk_note(),smufs_data_note(),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_smufs_watchdog_note(),native_smufs_cpu_policy_note(),native_smufs_boot_status_note(),smufs_watchdog_brk_note(),smufs_data_note(),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note(),smufs_tz_symlink_note());
+  return note;
+ }
+ 

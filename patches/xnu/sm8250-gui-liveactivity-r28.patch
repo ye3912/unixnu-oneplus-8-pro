@@ -1,0 +1,64 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1831,12 +1831,14 @@
+  static const struct {const char *name; uint64_t uuid_va, annotation_va; unsigned char uuid[16];} images[]={{"Foundation",0x186e21570ULL,0x1ed70b440ULL,{0x96,0x73,0x3d,0x34,0x0a,0x37,0x3c,0x34,0x81,0x0a,0x73,0x5d,0x17,0x20,0xae,0x42}},
+ {"CoreFoundation",0x187e72208ULL,0x1ed77b650ULL,{0xa4,0x22,0xc5,0x78,0x54,0xc4,0x30,0xc6,0x86,0xd8,0x5e,0xa8,0x1d,0x96,0x94,0xbe}},
+ {"libc++abi.dylib",0x1dd5307e0ULL,0x1efb39768ULL,{0xf1,0xb0,0xb7,0x0e,0xf8,0xd3,0x39,0xd9,0xa4,0xd6,0x03,0x68,0x5a,0xfe,0xe1,0xb6}}};
+- static unsigned counts[4];
+- const char *targets[]={"SpringBoard","backboardd","powerd","chronod"};
++ static unsigned counts[5];
++ const char *targets[]={"SpringBoard","backboardd","powerd","chronod","liveactivitiesd"};
++ _Static_assert(sizeof(counts) / sizeof(counts[0]) == sizeof(targets) / sizeof(targets[0]), "GUI target count");
+  unsigned enabled=0,index;
+  if(p!=current_proc())return;
+- for(index=0;index<4;++index)if(!strcmp(p->p_comm,targets[index]))break;
+- if(index==4)return;
++ for(index=0;index<sizeof(targets)/sizeof(targets[0]);++index)if(!strcmp(p->p_comm,targets[index]))break;
++ if(index==sizeof(targets)/sizeof(targets[0]))return;
++ bool liveactivity=index==4;
+  if(index==3) {
+   static const unsigned char expected_chronod[16]={0x1a,0xb6,0xa2,0x83,0x69,0x5a,0x3e,0x4a,0xa3,0xd4,0x2e,0x7a,0xa2,0xf2,0xdd,0x42};
+   unsigned char actual_chronod[16]={0};
+@@ -1845,8 +1847,15 @@
+  }
+  PE_parse_boot_argn("gui-exit-diag",&enabled,sizeof(enabled));
+  if(enabled!=1)return;
++ if(liveactivity) {
++  /* Original iPadOS 21H461 executable. Do not count a namesake or xpcproxy. */
++  static const unsigned char expected[16]={0x93,0x2d,0x7c,0xa3,0x17,0x03,0x36,0x18,0xb8,0xe6,0x8b,0xac,0x41,0xf8,0x57,0x5f};
++  unsigned char actual[16]={0};
++  proc_getexecutableuuid(p,actual,sizeof(actual));
++  if(memcmp(actual,expected,sizeof(actual)))return;
++ }
+  unsigned count=__atomic_load_n(&counts[index],__ATOMIC_RELAXED);
+- do {if(count>=3)return;} while(!__atomic_compare_exchange_n(&counts[index],&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
++ do {if(count>=(liveactivity?4U:3U))return;} while(!__atomic_compare_exchange_n(&counts[index],&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
+  os_reason_t reason=p->p_exit_reason;
+  const char *description=exit_reason_get_string_desc(reason);
+  printf("GUIEXIT22 name=%s pid%d event%u sig%d exit%d ns%u code%llx desc=%.512s\n",
+@@ -1854,8 +1863,15 @@
+   (unsigned long long)(reason?reason->osr_code:0),description?description:"none");
+  task_t task=proc_task(p);
+  unsigned char cache_uuid[16];uint32_t slide=0;
+- if((WTERMSIG(rv)!=SIGABRT && WTERMSIG(rv)!=SIGTRAP) || !task || !native_sm_gui_cache_identity(task,cache_uuid,&slide) || memcmp(cache_uuid,expected_cache,16))return;
+- printf("GUIEXIT22 cache-match1 slide%x\n",slide);
++ int sig=WTERMSIG(rv);
++ if(sig!=SIGABRT && sig!=SIGTRAP &&
++     !(liveactivity && (sig==SIGSEGV || sig==SIGBUS || sig==SIGILL)))return;
++ bool cache_ok=task && native_sm_gui_cache_identity(task,cache_uuid,&slide) && !memcmp(cache_uuid,expected_cache,16);
++ if(liveactivity)printf("LIVEACT28 owner pid%d event%u cache-match%d sig%d\n",
++     proc_getpid(p),count+1,cache_ok?1:0,sig);
++ if(cache_ok)printf("GUIEXIT22 cache-match1 slide%x\n",slide);
++ else if(!liveactivity)return;
++ else slide=0;
+  uint64_t state[15]={0};unsigned char exec_uuid[16]={0};char uuid_text[33]={0};
+  proc_getexecutableuuid(p,exec_uuid,sizeof(exec_uuid));
+  static const char hex[]="0123456789abcdef";
+@@ -1875,6 +1891,7 @@
+   }
+  } else printf("GUITRAP24 name=%s pid%d saved-state-unavailable\n",targets[index],proc_getpid(p));
+ 
++ if(!cache_ok)return; /* Raw state is usable without a cache match; annotations are not. */
+  for(unsigned i=0;i<sizeof(images)/sizeof(images[0]);++i) {
+   unsigned char uuid[16];uint64_t first[8]={0},after[8]={0};
+   int error=copyin(images[i].uuid_va+slide,uuid,sizeof(uuid));

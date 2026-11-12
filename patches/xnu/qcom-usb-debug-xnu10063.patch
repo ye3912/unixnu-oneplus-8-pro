@@ -1,0 +1,282 @@
+--- a/pexpert/arm/pe_kprintf.c
++++ b/pexpert/arm/pe_kprintf.c
+@@ -12,6 +12,10 @@
+ #include <kern/simple_lock.h>
+ #include <os/log_private.h>
+ #include <libkern/section_keywords.h>
++#if XNU_QCOM_USB_DEBUG
++#include <QcomXnuUsbDebug.h>
++#endif
++
+ 
+ /* Globals */
+ typedef void (*PE_kputc_t)(char);
+@@ -26,6 +30,21 @@
+ SECURITY_READ_ONLY_LATE(bool) disable_iolog_serial_output = false;
+ SECURITY_READ_ONLY_LATE(bool) enable_dklog_serial_output = false;
+ 
++#if XNU_QCOM_USB_DEBUG
++static bool qcom_usb_kprintf_requested;
++static void
++qcom_usb_tee(char c)
++{
++ /* The original video fallback already tees at console_write_unbuffered. */
++ if (PE_kputc == console_write_unbuffered) { PE_kputc(c); return; }
++ qcom_usb_debug_putc(c);
++ if (PE_kputc && PE_kputc != qcom_usb_debug_putc) PE_kputc(c);
++}
++#define QCOM_USB_KPRINTF_PUTC qcom_usb_tee
++#else
++#define QCOM_USB_KPRINTF_PUTC PE_kputc
++#endif
++
+ static SIMPLE_LOCK_DECLARE(kprintf_lock, 0);
+ 
+ static void serial_putc_crlf(char c);
+@@ -49,6 +68,10 @@
+ 	if (PE_parse_boot_argn("-enable_kprintf_spam", &enable_kprintf_spam, sizeof(enable_kprintf_spam))) {
+ 		disable_kprintf_output = false;
+ 	}
++#endif
++#if XNU_QCOM_USB_DEBUG
++ qcom_usb_kprintf_requested = !disable_kprintf_output;
++ disable_kprintf_output = true;
+ #endif
+ }
+ // Do this early, so other code can depend on whether kprintf is enabled.
+@@ -68,6 +91,11 @@
+ 		 */
+ 		PE_kputc = console_write_unbuffered;
+ 	}
++#if XNU_QCOM_USB_DEBUG
++	/* Preserve original screen/UART output; USB is an additional sink. */
++	(void)qcom_usb_debug_init();
++ disable_kprintf_output = !qcom_usb_kprintf_requested;
++#endif
+ }
+ STARTUP(KPRINTF, STARTUP_RANK_FIRST, PE_init_kprintf);
+ 
+@@ -78,7 +106,7 @@
+ 	va_list         listp;
+ 
+ 	va_start(listp, format);
+-	_doprnt_log(format, &listp, PE_kputc, 16);
++	_doprnt_log(format, &listp, QCOM_USB_KPRINTF_PUTC, 16);
+ 	va_end(listp);
+ }
+ #define MP_DEBUG_KPRINTF(x...)  _kprintf(x)
+@@ -121,7 +149,7 @@
+ 			cpu_last_locked = cpu_number();
+ 		}
+ 
+-		_doprnt_log(fmt, &listp, PE_kputc, 16);
++		_doprnt_log(fmt, &listp, QCOM_USB_KPRINTF_PUTC, 16);
+ 
+ 		simple_unlock(&kprintf_lock);
+ 
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1126,6 +1126,10 @@
+ }
+ #endif /* defined (__x86_64__) */
+ 
++#if XNU_QCOM_USB_DEBUG
++#include <QcomXnuUsbDebug.h>
++#endif
++
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wmissing-noreturn"
+ void
+@@ -1133,6 +1137,9 @@
+     uint64_t panic_options_mask, void *panic_data_ptr, unsigned long panic_caller)
+ {
+ #pragma clang diagnostic pop
++#if XNU_QCOM_USB_DEBUG
++ qcom_usb_debug_panic_prepare();
++#endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+@@ -1239,6 +1246,9 @@
+ void
+ panic_spin_forever(void)
+ {
++#if XNU_QCOM_USB_DEBUG
++ qcom_usb_debug_panic_drain();
++#endif
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+--- a/osfmk/kern/printf.c
++++ b/osfmk/kern/printf.c
+@@ -913,6 +913,10 @@
+ 	return vprintf_internal(fmt, ap, __builtin_return_address(0));
+ }
+ 
++#if XNU_QCOM_USB_DEBUG
++#include <QcomXnuUsbDebug.h>
++#endif
++
+ void
+ consdebug_putc(char c)
+ {
+@@ -920,7 +924,11 @@
+ 
+ 	debug_putc(c);
+ 
+-	if (!console_is_serial() && !disable_serial_output) {
++	if (!console_is_serial() && !disable_serial_output
++#if XNU_QCOM_USB_DEBUG
++        && PE_kputc != console_write_unbuffered && PE_kputc != qcom_usb_debug_putc
++#endif
++        ) {
+ 		PE_kputc(c);
+ 	}
+ }
+@@ -932,7 +940,11 @@
+ 
+ 	debug_putc(c);
+ 
+-	if (!console_is_serial() && !disable_serial_output) {
++	if (!console_is_serial() && !disable_serial_output
++#if XNU_QCOM_USB_DEBUG
++        && PE_kputc != console_write_unbuffered && PE_kputc != qcom_usb_debug_putc
++#endif
++        ) {
+ 		PE_kputc(c);
+ 	}
+ }
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -46,6 +46,10 @@
+ #include <kern/cpu_data.h>
+ #include <kern/sched_prim.h>
+ #include <libkern/section_keywords.h>
++#if XNU_QCOM_USB_DEBUG
++#include <QcomXnuUsbDebug.h>
++#endif
++
+ 
+ #if __arm64__
+ #include <machine/machine_routines.h>
+@@ -523,6 +527,13 @@
+ void
+ console_write(char *str, int size)
+ {
++#if XNU_QCOM_USB_DEBUG
++ /* Copy raw bytes before the original console can decline output. */
++ for (int offset = 0; str && offset < size;) {
++  int count = size-offset; if (count > 16384) count = 16384;
++  (void)qcom_usb_debug_write(str+offset, (size_t)count); offset += count;
++ }
++#endif
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+@@ -608,6 +619,9 @@
+ void
+ console_write_unbuffered(char c)
+ {
++#if XNU_QCOM_USB_DEBUG
++ qcom_usb_debug_putc(c);
++#endif
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+--- a/osfmk/console/serial_general.c
++++ b/osfmk/console/serial_general.c
+@@ -169,7 +169,10 @@
+ 		 * if boot-arg 'drain_uart_sync=1' is set, then
+ 		 * drain all the buffer right now and append new ch
+ 		 */
+-		if (serialmode & SERIALMODE_SYNCDRAIN) {
++#if !XNU_QCOM_USB_DEBUG
++		if (serialmode & SERIALMODE_SYNCDRAIN)
++#endif
++		{
+ 			info->str[info->pos] = '\0';
+ 			console_write(info->str, info->pos);
+ 			info->pos            = 0;
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -110,6 +110,13 @@
+ #include <sys/sysproto.h>
+ #include <kern/ux_handler.h>            /* for ux_handler_setup() */
+ #include <kern/sched_hygiene.h>
++#if XNU_QCOM_USB_DEBUG
++#include <QcomXnuUsbDebug.h>
++#endif
++#if XNU_QCOM_USB_DEBUG
++#include <kern/cpu_number.h>
++#include <kern/processor.h>
++#endif
+ 
+ #if (DEVELOPMENT || DEBUG)
+ #include <kern/debug.h>
+@@ -2288,12 +2295,66 @@
+ 	lock_trace = 1;
+ }
+ 
++#if XNU_QCOM_USB_DEBUG
++/* Exact Mach-private declarations hidden from the BSD translation unit. */
++extern processor_t thread_bind(processor_t processor);
++extern void thread_terminate_self(void);
++static unsigned qcom_usb_worker_started;
++static char qcom_usb_status_note[160];static unsigned qcom_usb_status_ready;
++const char *native_sm_usb_status_note(void) {
++ return __atomic_load_n(&qcom_usb_status_ready,__ATOMIC_ACQUIRE)?qcom_usb_status_note:"SMUSB21 worker status unavailable\n";
++}
++static void qcom_usb_log_worker(void *arg __unused, wait_result_t result __unused)
++{
++ processor_t processor = cpu_to_processor(master_cpu);
++ struct qcom_usb_debug_status status = {0};
++ thread_set_thread_name(current_thread(), "qcom-usb-log");
++ if (processor == PROCESSOR_NULL) goto out;
++ thread_bind(processor); thread_block(THREAD_CONTINUE_NULL);
++ if (cpu_number() != master_cpu) goto out;
++ qcom_usb_debug_get_status(&status);
++ snprintf(qcom_usb_status_note,sizeof(qcom_usb_status_note),
++  "SMUSB21 worker cpu%d ph%u err%u prep%u st%u dma%u dom%u bank%u slot%u\n",
++  cpu_number(),status.phase,status.error,status.prepare_result,status.prepare_stage,
++  status.dma_mode,status.domain_result,status.domain_bank,status.domain_slot);
++ __atomic_store_n(&qcom_usb_status_ready,1U,__ATOMIC_RELEASE);
++ printf("SMUSB21 worker cpu%d phase%u err%u prep%u stage%u dma%u domain%u\n",
++  cpu_number(),status.phase,status.error,status.prepare_result,status.prepare_stage,status.dma_mode,status.domain_result);
++ if (status.phase == QCOM_USB_DEBUG_ACTIVE && status.dma_mode == QCOM_USB_DEBUG_DMA_PRIVATE_TRANSLATED)
++  printf("PLATFORM-DMA usb pa=%llx iova=%llx tables=%llx bank=%u slot=%u dma_bits=%u\n",
++   status.dma_pa,status.dma_iova,status.tables_pa,status.domain_bank,status.domain_slot,status.dma_address_width);
++ while (!panic_active()) {
++  uint64_t deadline;
++  qcom_usb_debug_get_status(&status);
++  if (status.phase != QCOM_USB_DEBUG_ACTIVE) break;
++  qcom_usb_debug_poll();
++  clock_interval_to_deadline(5,NSEC_PER_MSEC,&deadline);
++  if (assert_wait_deadline((event_t)&qcom_usb_worker_started,THREAD_UNINT,deadline)==THREAD_WAITING)
++   thread_block(THREAD_CONTINUE_NULL);
++ }
++out:
++ thread_bind(PROCESSOR_NULL);thread_terminate_self();
++}
++static void qcom_usb_start_log_worker(void)
++{
++ int enabled=0;unsigned expected=0;thread_t worker=THREAD_NULL;
++ if (!PE_parse_boot_argn("qcom-usb-debug",&enabled,sizeof(enabled)) || enabled!=1) return;
++ if (!__atomic_compare_exchange_n(&qcom_usb_worker_started,&expected,1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return;
++ kern_return_t result=kernel_thread_start(qcom_usb_log_worker,NULL,&worker);
++ if (result==KERN_SUCCESS) thread_deallocate(worker);
++ else printf("SMUSB21 worker failed %d\n",result);
++}
++#endif
++
+ kern_return_t
+ bsd_autoconf(void)
+ {
+ 	kprintf("bsd_autoconf: calling kminit\n");
+ 	native_smufs_root_trace_emit(SMRT_KMINIT_ENTER, 0, SMRT_NONE, 0, 0, 0);
+ 	kminit();
++#if XNU_QCOM_USB_DEBUG
++	qcom_usb_start_log_worker();
++#endif
+ 	native_smufs_root_trace_emit(SMRT_KMINIT_RETURN, 0, SMRT_NONE, 0, 0, 0);
+ 
+ 	/*

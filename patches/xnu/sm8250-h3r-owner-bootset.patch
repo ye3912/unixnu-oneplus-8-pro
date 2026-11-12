@@ -1,0 +1,120 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -819,6 +819,8 @@
+ /* Modes1/2 diagnose; mode3 prepares the verified cache directory for original dyld. */
+ extern uint32_t smufs_cache_probe_device(uint32_t,uint32_t *,char *,uint64_t *,uint32_t *);
+ extern uint32_t smufs_systemos_snapshot(uint64_t *,uint64_t *,uint32_t *);
++extern int native_smufs_bootset_publish(uint32_t,uint32_t,int32_t,uint64_t);
++extern const char *native_smufs_bootset_note(void);
+ struct SmUfsCacheProbe {
+  uint32_t stage,selected,mounted,matches,postmatches,root_before,root_after,readonly,fs_apfs,root_same;
+  uint32_t mount_enter,mount_return,files,index,main_ok,lib_ok,images,subs;
+@@ -1118,14 +1120,14 @@
+ __attribute__((noinline)) const char *
+ native_smufs_cache_panic_note(void)
+ {
+- static char note[1488];
++ static char note[1760];
+  if(!__atomic_load_n(&smufs_cache_carrier.ready,__ATOMIC_ACQUIRE))return "";
+- snprintf(note,sizeof(note),"SMUFS cache-h3q prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s",
++ snprintf(note,sizeof(note),"SMUFS cache-h3r prep1 stdio%u carrier %u/%u first-stage%u\nmap %u/%u errno%d first%d\n%s%s%s",
+      __atomic_load_n(&smufs_cache_stdio_ready,__ATOMIC_ACQUIRE),
+      __atomic_load_n(&smufs_cache_carrier.accepts,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.rejects,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.first_stage,__ATOMIC_RELAXED),__atomic_load_n(&smufs_cache_carrier.map_enter,__ATOMIC_RELAXED),
+      __atomic_load_n(&smufs_cache_carrier.map_return,__ATOMIC_ACQUIRE),__atomic_load_n(&smufs_cache_carrier.map_error,__ATOMIC_RELAXED),
+-     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),smufs_cache_io_note(),smufs_mount_output_note());
++     __atomic_load_n(&smufs_cache_carrier.first_map_error,__ATOMIC_RELAXED),native_smufs_bootset_note(),smufs_cache_io_note(),smufs_mount_output_note());
+  return note;
+ }
+ 
+@@ -1140,13 +1142,13 @@
+        "cache files%u/53 index%u main%u images%u subs%u lib%u\n"
+        "file %.112s\n"
+        "policy flags%u self%u/15 units201600 checked%llu bad%llu\n"
+-       "probe-only%u cache-exec0 sys-integrity%u\n",
++       "probe-only%u cache-exec0 sys-integrity%u\n%s",
+        v->mode==3?"SMUFS cache-h3l":(v->mode==2?"SMUFS cache-h3k":"SMUFS cache-h3j"),phase,v->error,v->stage,v->root_before,v->root_after,v->root_same,smufs_saved_autherr,smufs_saved_owner,
+        v->selected,v->mounted,v->matches,v->postmatches,v->readonly,v->fs_apfs,
+        (unsigned long long)v->media,(unsigned long long)v->postmedia,
+        v->mount_enter,v->mount_return,v->mount_error,v->device,v->files,v->index,v->main_ok,v->images,v->subs,v->lib_ok,v->file,
+        v->system_flags,v->system_selftests,(unsigned long long)v->system_checked,(unsigned long long)v->system_bad,
+-       v->mode!=3,(v->mode==2 || v->mode==3) && v->system_flags==15 && !v->system_bad);
++       v->mode!=3,(v->mode==2 || v->mode==3) && v->system_flags==15 && !v->system_bad,v->mode==3?native_smufs_bootset_note():"");
+ }
+ __attribute__((noinline)) uint64_t
+ native_smufs_cache_prepare(uint64_t scratch)
+@@ -1218,6 +1220,7 @@
+      (v->error=copyout(vector,scratch+0x500,sizeof(vector))))smufs_cache_probe_report("cache-environment",v);
+   v->root_same=rootvnode==v->original_root;v->root_after=smufs_cache_root_valid();
+   if(!v->root_same||!v->root_after||!smufs_cache_integrity_valid(v,1)){v->error=EAUTH;smufs_cache_probe_report("continue-policy",v);}
++  if(!native_smufs_bootset_publish((uint32_t)rootdev,v->selected,smufs_saved_autherr,v->media)){v->error=EAUTH;smufs_cache_probe_report("bootset-publication",v);}
+   if(!smufs_cache_carrier_publish(v)){v->error=EAUTH;smufs_cache_probe_report("carrier-publication",v);}
+   v->error=native_smufs_cache_prepare_stdio();
+   if(v->error)smufs_cache_probe_report("init-stdio",v);
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -570,6 +570,64 @@
+ 	return result;
+ }
+ 
++/* SMUFS owner metadata is derived only after both actual readonly mounts and
++ * policies pass. It does not assert Apple secure-boot/firmware personalization.
++ * Sole caller is PID1 preparation before any original user program is executed.
++ */
++#if !DEVELOPMENT && !DEBUG
++#error SMUFS owner image-set metadata requires a development kernel
++#endif
++extern "C" uint32_t smufs_owner_bootset_digest(uint32_t,uint32_t,int32_t,uint64_t,uint8_t[48]);
++extern "C" {
++int native_smufs_bootset_status=-1;
++uint8_t native_smufs_bootset_hash[48];
++}
++static const char smufs_bootset_domain[]="SMUFS.OwnerBootSet.v1";
++static const char smufs_bootset_policy[]="os=rsa3072-sha256;systemos=kernel-sha256-pin;not-apple-personalization";
++extern "C" __attribute__((noinline)) int
++native_smufs_bootset_publish(uint32_t root,uint32_t system,int32_t apple_error,uint64_t media)
++{
++ int expected=-1;
++ if(!__atomic_compare_exchange_n(&native_smufs_bootset_status,&expected,-2,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return 0;
++ uint8_t digest[48];
++ if(!smufs_owner_bootset_digest(root,system,apple_error,media,digest)){
++  __atomic_store_n(&native_smufs_bootset_status,1,__ATOMIC_RELEASE);return 0;}
++ IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane);
++ if(!chosen){__atomic_store_n(&native_smufs_bootset_status,2,__ATOMIC_RELEASE);return 0;}
++ // Existing firmware or owner metadata is a conflict, even if bytes match.
++ if(chosen->getProperty("boot-manifest-hash")||chosen->getProperty("owner-boot-manifest-domain")||chosen->getProperty("owner-boot-manifest-policy")){
++  chosen->release();__atomic_store_n(&native_smufs_bootset_status,3,__ATOMIC_RELEASE);return 0;}
++ OSData *value=OSData::withBytes(digest,sizeof(digest));
++ OSData *tag=OSData::withBytes(smufs_bootset_domain,sizeof(smufs_bootset_domain));
++ OSData *policy=OSData::withBytes(smufs_bootset_policy,sizeof(smufs_bootset_policy));
++ if(!value||!tag||!policy){OSSafeReleaseNULL(value);OSSafeReleaseNULL(tag);OSSafeReleaseNULL(policy);chosen->release();
++  __atomic_store_n(&native_smufs_bootset_status,4,__ATOMIC_RELEASE);return 0;}
++ bool tagged=chosen->setProperty("owner-boot-manifest-domain",tag);
++ bool described=tagged&&chosen->setProperty("owner-boot-manifest-policy",policy);
++ bool published=described&&chosen->setProperty("boot-manifest-hash",value);
++ uint8_t actual[48];size_t actualSize=sizeof(actual);
++ bool result=published&&chosen->getProperty("owner-boot-manifest-domain")==tag&&chosen->getProperty("owner-boot-manifest-policy")==policy&&
++     chosen->getProperty("boot-manifest-hash")==value&&IOGetBootManifestHash(reinterpret_cast<char *>(actual),&actualSize)&&
++     actualSize==sizeof(digest)&&!memcmp(actual,digest,sizeof(digest));
++ if(result)memcpy(native_smufs_bootset_hash,actual,sizeof(actual));
++ else{
++  // Roll back only properties still owned by this attempt.
++  if(published&&chosen->getProperty("boot-manifest-hash")==value)chosen->removeProperty("boot-manifest-hash");
++  if(described&&chosen->getProperty("owner-boot-manifest-policy")==policy)chosen->removeProperty("owner-boot-manifest-policy");
++  if(tagged&&chosen->getProperty("owner-boot-manifest-domain")==tag)chosen->removeProperty("owner-boot-manifest-domain");
++ }
++ OSSafeReleaseNULL(value);OSSafeReleaseNULL(tag);OSSafeReleaseNULL(policy);chosen->release();
++ __atomic_store_n(&native_smufs_bootset_status,result?0:5,__ATOMIC_RELEASE);return result;
++}
++extern "C" __attribute__((noinline)) const char *
++native_smufs_bootset_note(void)
++{
++ static char note[208];char hex[97];static const char digits[]="0123456789abcdef";
++ int status=__atomic_load_n(&native_smufs_bootset_status,__ATOMIC_ACQUIRE);
++ for(unsigned i=0;i<48;++i){uint8_t b=status==0?native_smufs_bootset_hash[i]:0;hex[2*i]=digits[b>>4];hex[2*i+1]=digits[b&15];}hex[96]=0;
++ snprintf(note,sizeof(note),"bootset owner%u status%d firmware0 sha384%s\n",status==0,status,hex);return note;
++}
++
+ #if defined(XNU_OWNER_BOOT_MANIFEST) && XNU_OWNER_BOOT_MANIFEST
+ #if !DEVELOPMENT && !DEBUG
+ #error Owner image-set metadata is an offline development instrument

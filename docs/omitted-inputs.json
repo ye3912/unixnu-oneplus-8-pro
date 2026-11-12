@@ -1,0 +1,22 @@
+[
+  {
+    "path": "drivers/Sm8250Ufs/OwnerKey.bin",
+    "bytes": 395,
+    "reason": "external/private binary or generated input"
+  },
+  {
+    "path": "drivers/Sm8250Ufs/OwnerPolicy.bin",
+    "bytes": 11870848,
+    "reason": "external/private binary or generated input"
+  },
+  {
+    "path": "drivers/Sm8250Ufs/OwnerWrongUuidHeader.bin",
+    "bytes": 544,
+    "reason": "external/private binary or generated input"
+  },
+  {
+    "path": "drivers/Sm8250Ufs/SystemOsHashes.bin",
+    "bytes": 6451200,
+    "reason": "external/private binary or generated input"
+  }
+]

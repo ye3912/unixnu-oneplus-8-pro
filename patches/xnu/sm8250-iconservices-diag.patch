@@ -1,0 +1,102 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1831,12 +1831,15 @@
+  static const struct {const char *name; uint64_t uuid_va, annotation_va; unsigned char uuid[16];} images[]={{"Foundation",0x186e21570ULL,0x1ed70b440ULL,{0x96,0x73,0x3d,0x34,0x0a,0x37,0x3c,0x34,0x81,0x0a,0x73,0x5d,0x17,0x20,0xae,0x42}},
+ {"CoreFoundation",0x187e72208ULL,0x1ed77b650ULL,{0xa4,0x22,0xc5,0x78,0x54,0xc4,0x30,0xc6,0x86,0xd8,0x5e,0xa8,0x1d,0x96,0x94,0xbe}},
+ {"libc++abi.dylib",0x1dd5307e0ULL,0x1efb39768ULL,{0xf1,0xb0,0xb7,0x0e,0xf8,0xd3,0x39,0xd9,0xa4,0xd6,0x03,0x68,0x5a,0xfe,0xe1,0xb6}}};
+- static unsigned counts[7];
+- const char *targets[]={"SpringBoard","backboardd","powerd","chronod","liveactivitiesd","pkd","Preferences"};
++ static unsigned counts[8];
++ const char *targets[]={"SpringBoard","backboardd","powerd","chronod","liveactivitiesd","pkd","Preferences","iconservicesagent"};
+  _Static_assert(sizeof(counts) / sizeof(counts[0]) == sizeof(targets) / sizeof(targets[0]), "GUI target count");
+  unsigned enabled=0,index;
+  if(p!=current_proc())return;
+- for(index=0;index<sizeof(targets)/sizeof(targets[0]);++index)if(!strcmp(p->p_comm,targets[index]))break;
++ for(index=0;index<sizeof(targets)/sizeof(targets[0]);++index) {
++  const char *name = index==7 ? proc_best_name(p) : p->p_comm;
++  if(!strcmp(name,targets[index]))break;
++ }
+  if(index==sizeof(targets)/sizeof(targets[0]))return;
+  bool liveactivity=index==4;
+  bool pkd=index==5;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2226,6 +2226,7 @@
+  unsigned peer_event=0;
+  unsigned peer_kind=0;
+ 	unsigned preferences_event = 0;
++	bool icon_agent = false;
+ #endif
+ 	proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+ 
+@@ -2290,15 +2291,16 @@
+ 	static const char preferences_suffix[] = "/Preferences.app/Preferences";
+ 	size_t path_length = strlen(excpath);
+ 	const size_t suffix_length = sizeof(preferences_suffix) - 1;
+-	if (path_length >= suffix_length &&
+-	    strcmp(excpath + path_length - suffix_length, preferences_suffix) == 0) {
++	icon_agent = strcmp(excpath, "/System/Library/CoreServices/iconservicesagent") == 0;
++	if (icon_agent || (path_length >= suffix_length &&
++	    strcmp(excpath + path_length - suffix_length, preferences_suffix) == 0)) {
+ 		unsigned enabled = 0;
+ 		if (PE_parse_boot_argn("gui-exit-diag", &enabled, sizeof(enabled)) && enabled == 1) {
+-			static unsigned attempts;
+-			unsigned count = __atomic_fetch_add(&attempts, 1, __ATOMIC_RELAXED);
++			static unsigned attempts[2];
++			unsigned count = __atomic_fetch_add(&attempts[icon_agent], 1, __ATOMIC_RELAXED);
+ 			if (count < 8) {
+ 				preferences_event = count + 1;
+-				printf("PREFDIAG attempt=%u caller=%d target=%d\n", preferences_event,
++				printf("%s attempt=%u caller=%d target=%d\n", icon_agent ? "ICONDIAG" : "PREFDIAG", preferences_event,
+ 				    proc_getpid(current_proc()), proc_getpid(p));
+ 			}
+ 		}
+@@ -2472,7 +2474,8 @@
+   peer_kind,peer_event,proc_getpid(p),error);
+  if(chrono_event)printf("CHRONO27 exec result%u pid%d errno%d\n",chrono_event,proc_getpid(p),error);
+ 	if (preferences_event) {
+-		printf("PREFDIAG result=%u target=%d error=%d\n", preferences_event, proc_getpid(p), error);
++		printf("%s result=%u target=%d error=%d\n", icon_agent ? "ICONDIAG" : "PREFDIAG",
++		    preferences_event, proc_getpid(p), error);
+ 	}
+ #endif
+ 	return error;
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1787,7 +1787,7 @@
+ }
+ 
+ 
+-/* Export a bounded prefix of the latest Settings crash report on verified Data. */
++/* Export a bounded prefix of the selected crash report on verified Data. */
+ static void
+ sm8250_preferences_report(void)
+ {
+@@ -1798,10 +1798,14 @@
+         "/private/var/root/Library/Logs/CrashReporter",
+     };
+     unsigned enabled = 0;
+-    if (!PE_parse_boot_argn("sm8250-pref-report", &enabled, sizeof(enabled)) || enabled != 1 ||
++    if (!PE_parse_boot_argn("sm8250-pref-report", &enabled, sizeof(enabled)) ||
++        (enabled != 1 && enabled != 2) ||
+         proc_getpid(current_proc()) != 1 || native_data_persist_state != 2) {
+         return;
+     }
++    const char *prefix = enabled == 2 ? "iconservicesagent-" : "Preferences-";
++    size_t prefix_length = strlen(prefix);
++    printf("PREFIPS target=%s\n", enabled == 2 ? "iconservicesagent" : "Preferences");
+     vfs_context_t ctx = vfs_context_kernel();
+     vnode_t data = NULLVP;
+     int error = vnode_lookup("/private/var", VNODE_LOOKUP_NOFOLLOW, &data, ctx);
+@@ -1852,9 +1856,9 @@
+                 if (record < name_offset + 1 || record > used - at || (record & 3)) break;
+                 at += record;
+                 const char *name = entry->d_name;
+-                if (length < 16 || length > 120 || length >= record - name_offset ||
++                if (length < prefix_length + 4 || length > 120 || length >= record - name_offset ||
+                     name[length] || strnlen(name, length) != length || strchr(name, '/') ||
+-                    memcmp(name, "Preferences-", 12) || memcmp(name + length - 4, ".ips", 4)) {
++                    memcmp(name, prefix, prefix_length) || memcmp(name + length - 4, ".ips", 4)) {
+                     continue;
+                 }
+                 char path[256];
